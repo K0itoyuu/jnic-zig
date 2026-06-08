@@ -123,13 +123,60 @@ zig build -Doptimize=ReleaseFast
 | `watermark` | string | `"JNIC-zig"` | 嵌入到 native 库中的水印字符串 |
 | `use_ffm` | bool | `false` | 使用 FFM API (Java 22+) 代替 JNI |
 | `anti_debug` | bool | `true` | 注入反调试检测代码 |
-| `renamer` | bool | `false` | 随机化 DLL 中的所有符号名 |
+| `renamer` | bool | `false` | 随机化 DLL 中的所有符号名（IDA 风格 `sub_180XXXXX`） |
+| `remove_native_annotation` | bool | `false` | 混淆后删除所有混淆注解 |
 | `input_jar` | string | `"./input.jar"` | 输入 JAR 路径 |
 | `output_jar` | string | `"./output.jar"` | 输出 JAR 路径 |
 
+## 性能基准测试
+
+所有测试开启 `@Native` + `@StringEncrypt` + `@NumberEncrypt`，使用 `-O3` 编译 native 库。
+
+### 纯计算方法（自动 Transpile 为 C）
+
+纯计算方法（无方法调用、无对象操作）被直接翻译为等价 C 代码，由 C 编译器 -O3 优化。
+
+| 测试项 | Java JIT | Native (Transpile) | 比率 |
+|--------|----------|-------------------|------|
+| Int 算术 (10M iter) | 27ms | **3ms** | **9x 更快** |
+| Long 算术 (5M iter) | 13ms | **4ms** | **3x 更快** |
+| 位运算 (10M iter) | 18ms | **9ms** | **2x 更快** |
+| 嵌套循环 (1K×1K) | 4ms | **0ms** | **>4x 更快** |
+| **合计** | **62ms** | **16ms** | **3.9x 更快** |
+
+### 混合方法（解释器 + JNI 回调）
+
+包含方法调用的方法走 JVM 字节码解释器。
+
+| 测试项 | Java JIT | Native (Interpreter) | 比率 |
+|--------|----------|---------------------|------|
+| For 循环 (1M) | 1ms | 17ms | 17x |
+| While 循环 (1M) | 3ms | 27ms | 9x |
+| 字符串拼接 (1K次) | 8ms | **3ms** | **2.7x 更快** |
+| 嵌套循环 (1K×1K) | 3ms | 19ms | 6x |
+| **合计** | **15ms** | **66ms** | **4.4x** |
+
+### 加密常量访问
+
+`@StringEncrypt` / `@NumberEncrypt` 注解的常量在 native 层 XOR 加密存储，运行时直接在 C 层解密（零 JNI 开销）。
+
+| 测试项 | Java JIT | Native (加密 + 解密) | 比率 |
+|--------|----------|---------------------|------|
+| 5×int + 5×long + 5×String 字段访问 | 20ms | **1ms** | **20x 更快** |
+
+### 完整 Obfuscator Test Suite
+
+| 测试 | 结果 |
+|------|------|
+| Test #1: Basics (7项) | 全部 PASS |
+| Test #2: Reflects (8项) | 6 PASS, 2 N/A (JDK 兼容) |
+| Test #3: Calc benchmark | 393ms (baseline 35ms) |
+
 ## 注意事项
 
-- 含有大量 `String +=` 循环的方法（编译为 `invokedynamic` string concat）在解释器中性能较差，建议排除
+- 纯计算方法自动使用 Transpile 模式（性能超越 JIT）
+- 含 JNI 调用的方法使用解释器模式（约 4-17x，取决于 JNI 调用密度）
+- 字符串拼接因 StringBuilder 预缓存优化，反而比 JIT 更快
 - `<init>`、`<clinit>` 不会被 native 化
 - 需要 `-Xss4m` 以支持深度递归的 native 方法
 - Java 17+ 需要 `--enable-native-access=ALL-UNNAMED`
