@@ -54,7 +54,7 @@ pub fn nativize(allocator: std.mem.Allocator, cf: *types.ClassFile) !NativizeRes
         if (main_code_data) |mcd| {
             try extracted.append(allocator, ExtractedMethod{
                 .class_name = cf.getThisClassName() orelse class_name,
-                .method_name = "yuri$main",
+                .method_name = "jnic$main",
                 .descriptor = "([Ljava/lang/String;)V",
                 .is_static = true,
                 .code_data = mcd,
@@ -72,7 +72,7 @@ pub fn nativize(allocator: std.mem.Allocator, cf: *types.ClassFile) !NativizeRes
         for (cf.methods) |*method| {
             const name = cf.getUtf8(method.name_index) orelse continue;
             // Skip constructors, clinit, main (main is now a stub), and runStr
-            if (std.mem.eql(u8, name, "<init>") or std.mem.eql(u8, name, "<clinit>") or std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "yuri$main") or std.mem.eql(u8, name, "runStr")) continue;
+            if (std.mem.eql(u8, name, "<init>") or std.mem.eql(u8, name, "<clinit>") or std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "jnic$main") or std.mem.eql(u8, name, "runStr")) continue;
             if (method.access_flags & types.ACC_NATIVE != 0) continue;
             if (method.access_flags & types.ACC_ABSTRACT != 0) continue;
 
@@ -84,7 +84,7 @@ pub fn nativize(allocator: std.mem.Allocator, cf: *types.ClassFile) !NativizeRes
         for (anno.method_indices) |idx| {
             const method = &cf.methods[idx];
             const name = cf.getUtf8(method.name_index) orelse continue;
-            if (std.mem.eql(u8, name, "<init>") or std.mem.eql(u8, name, "<clinit>") or std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "yuri$main") or std.mem.eql(u8, name, "runStr")) continue;
+            if (std.mem.eql(u8, name, "<init>") or std.mem.eql(u8, name, "<clinit>") or std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "jnic$main") or std.mem.eql(u8, name, "runStr")) continue;
             if (method.access_flags & types.ACC_NATIVE != 0) continue;
             if (method.access_flags & types.ACC_ABSTRACT != 0) continue;
 
@@ -116,7 +116,7 @@ fn injectLoadLibrary(allocator: std.mem.Allocator, cf: *types.ClassFile) !void {
     try addOrModifyClinit(allocator, cf, cp_code_name, cp_lib_string, cp_loadlib_ref);
 }
 
-/// Transform main: extract body to yuri$main (native), rewrite main to load lib + call yuri$main
+/// Transform main: extract body to jnic$main (native), rewrite main to load lib + call jnic$main
 fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name: []const u8) !void {
     _ = class_name;
 
@@ -137,7 +137,7 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
     if (main_idx == null or main_code == null) return;
 
     // Add constant pool entries we need:
-    // - Utf8 "yuri$main"
+    // - Utf8 "jnic$main"
     // - Utf8 "([Ljava/lang/String;)V"  (already exists for main)
     // - Utf8 "java/lang/System"
     // - Utf8 "loadLibrary"
@@ -148,11 +148,11 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
     // - String "yurijvm_native"
     // - NameAndType loadLibrary:(Ljava/lang/String;)V
     // - Methodref System.loadLibrary
-    // - NameAndType yuri$main:([Ljava/lang/String;)V
-    // - Methodref thisClass.yuri$main
+    // - NameAndType jnic$main:([Ljava/lang/String;)V
+    // - Methodref thisClass.jnic$main
 
     // Find or add UTF8 entries
-    const cp_yuri_main = try findOrAddUtf8(allocator, cf, "yuri$main");
+    const cp_yuri_main = try findOrAddUtf8(allocator, cf, "jnic$main");
     const cp_main_desc = try findOrAddUtf8(allocator, cf, "([Ljava/lang/String;)V");
     const cp_system_name = try findOrAddUtf8(allocator, cf, "java/lang/System");
     const cp_loadlib_name = try findOrAddUtf8(allocator, cf, "loadLibrary");
@@ -168,13 +168,13 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
     const cp_loadlib_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_loadlib_name, .descriptor_index = cp_str_void_desc } });
     // Add Methodref for System.loadLibrary
     const cp_loadlib_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cp_system_class, .name_and_type_index = cp_loadlib_nat } });
-    // Add NameAndType for yuri$main:([Ljava/lang/String;)V
+    // Add NameAndType for jnic$main:([Ljava/lang/String;)V
     const cp_yurimain_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_yuri_main, .descriptor_index = cp_main_desc } });
-    // Add Methodref for thisClass.yuri$main
+    // Add Methodref for thisClass.jnic$main
     const cp_yurimain_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_yurimain_nat } });
 
-    // === Create yuri$main method (native, with main's original code extracted later) ===
-    // yuri$main is public static native void yuri$main(String[] args)
+    // === Create jnic$main method (native, with main's original code extracted later) ===
+    // jnic$main is public static native void jnic$main(String[] args)
     const yuri_method = types.MethodInfo{
         .access_flags = types.ACC_PUBLIC | types.ACC_STATIC | types.ACC_NATIVE,
         .name_index = cp_yuri_main,
@@ -182,7 +182,7 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
         .attributes = &.{},
     };
 
-    // === Rewrite main's Code to: invokestatic yuri$main(args); return ===
+    // === Rewrite main's Code to: invokestatic jnic$main(args); return ===
     // Bytecode: aload_0, invokestatic cp_yurimain_ref, return
     // Code attribute: max_stack=1, max_locals=1, code_length=5
     var main_bytecode: [13]u8 = undefined;
@@ -216,7 +216,7 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
     // Bytecode: ldc cp_lib_string, invokestatic cp_loadlib_ref, return
     try addOrModifyClinit(allocator, cf, cp_code_name, cp_lib_string, cp_loadlib_ref);
 
-    // === Add yuri$main to methods array ===
+    // === Add jnic$main to methods array ===
     var new_methods = try allocator.alloc(types.MethodInfo, cf.methods.len + 1);
     @memcpy(new_methods[0..cf.methods.len], cf.methods);
     new_methods[cf.methods.len] = yuri_method;

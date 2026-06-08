@@ -473,11 +473,11 @@ fn emitEncryptedRegistration(allocator: std.mem.Allocator, buf: *std.ArrayList(u
         \\        jclass cls = (*env)->FindClass(env, "{s}");
         \\        if (cls) {{
         \\            JNINativeMethod nms[] = {{
-        \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_ns}},
-        \\                {{"yuri$native_int", "(J)I", (void*)_ni}},
-        \\                {{"yuri$native_long", "(J)J", (void*)_nl}},
-        \\                {{"yuri$native_float", "(J)F", (void*)_nf}},
-        \\                {{"yuri$native_double", "(J)D", (void*)_nd}}
+        \\                {{"jnic$native_string", "(JJ)Ljava/lang/String;", (void*)_ns}},
+        \\                {{"jnic$native_int", "(JJ)I", (void*)_ni}},
+        \\                {{"jnic$native_long", "(JJ)J", (void*)_nl}},
+        \\                {{"jnic$native_float", "(JJ)F", (void*)_nf}},
+        \\                {{"jnic$native_double", "(JJ)D", (void*)_nd}}
         \\            }};
         \\            (*env)->RegisterNatives(env, cls, nms, 5);
         \\        }}
@@ -538,7 +538,7 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
     try buf.print(allocator, "EncStr _enc_strs[] = {{\n", .{});
     for (enc_strings) |s| {
         try buf.print(allocator, "    {{{d}LL, \"", .{s.key});
-        const dk: [8]u8 = @bitCast(s.key ^ master_key);
+        const dk: [8]u8 = @bitCast(s.key ^ s.decode_key ^ master_key);
         for (s.value, 0..) |ch, i| {
             var v: u8 = ch;
             // 4 rounds of encryption
@@ -558,7 +558,7 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
     try buf.print(allocator, "EncNum _enc_nums[] = {{\n", .{});
     for (enc_numbers) |n| {
         const plain_bytes: [8]u8 = @bitCast(n.value);
-        const dk: [8]u8 = @bitCast(n.key ^ master_key);
+        const dk: [8]u8 = @bitCast(n.key ^ n.decode_key ^ master_key);
         var enc_bytes: [8]u8 = undefined;
         for (0..8) |i| {
             var v: u8 = plain_bytes[i];
@@ -592,17 +592,17 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
         \\    }
         \\    return v;
         \\}
-        \\static jobject _ns(JNIEnv *env, jclass c, jlong key) {
+        \\static jobject _ns(JNIEnv *env, jclass c, jlong key, jlong dk) {
         \\    (void)c;
-        \\    int64_t dk64 = key ^ __runtime_master_key;
-        \\    uint8_t *dk = (uint8_t*)&dk64;
+        \\    int64_t dk64 = key ^ dk ^ __runtime_master_key;
+        \\    uint8_t *dkb = (uint8_t*)&dk64;
         \\    uint8_t *mk = (uint8_t*)&__runtime_master_key;
         \\    for (int i = 0; _enc_strs[i].enc != NULL; i++) {
         \\        if (_enc_strs[i].key == key) {
         \\            if (i < 256 && _str_cached[i]) return _str_cache[i];
         \\            int32_t len = _enc_strs[i].len;
         \\            char *d = (char*)malloc(len+1);
-        \\            for (int j=0;j<len;j++) d[j]=_db((uint8_t)_enc_strs[i].enc[j],dk,mk,j);
+        \\            for (int j=0;j<len;j++) d[j]=_db((uint8_t)_enc_strs[i].enc[j],dkb,mk,j);
         \\            d[len]=0;
         \\            jstring r=(*env)->NewStringUTF(env,d); free(d);
         \\            if(i<256){_str_cache[i]=(*env)->NewGlobalRef(env,r);_str_cached[i]=1;}
@@ -611,25 +611,25 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
         \\    }
         \\    return (*env)->NewStringUTF(env,"");
         \\}
-        \\static jint _ni(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
-        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\static jint _ni(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
         \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==0){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<4;j++)d[j]=_db(ev[j],dk,mk,j);jint r;memcpy(&r,d,4);return r;}}
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==0){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jint r;memcpy(&r,d,4);return r;}}
         \\    return 0;}
-        \\static jlong _nl(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
-        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\static jlong _nl(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
         \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==1){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dk,mk,j);jlong r;memcpy(&r,d,8);return r;}}
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==1){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jlong r;memcpy(&r,d,8);return r;}}
         \\    return 0;}
-        \\static jfloat _nf(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
-        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\static jfloat _nf(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
         \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==2){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[4];for(int j=0;j<4;j++)d[j]=_db(ev[j],dk,mk,j);jfloat r;memcpy(&r,d,4);return r;}}
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==2){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[4];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jfloat r;memcpy(&r,d,4);return r;}}
         \\    return 0.0f;}
-        \\static jdouble _nd(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
-        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\static jdouble _nd(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
         \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==3){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dk,mk,j);jdouble r;memcpy(&r,d,8);return r;}}
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==3){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jdouble r;memcpy(&r,d,8);return r;}}
         \\    return 0.0;}
         \\
         \\

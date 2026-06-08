@@ -370,19 +370,22 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
     /* invoke */
     case 0xb6:case 0xb7:case 0xb8:case 0xb9:{
         uint16_t idx=RU16(c,pc+1);int is_s=(op==0xb8);int adv=(op==0xb9)?5:3;
-        /* Inline encrypted constant lookup for yuri$native_* methods */
+        /* Inline encrypted constant lookup for jnic$native_* methods */
         if (is_s && idx<cpc && (cp[idx].tag==JVM_CP_METHODREF||cp[idx].tag==JVM_CP_IFACEREF)) {
             const char *_mn = cp[idx].data.ref.name;
-            if (_mn[0]=='y' && _mn[1]=='u' && _mn[2]=='r' && _mn[3]=='i' && _mn[4]=='$') {
-                /* yuri$native_string / yuri$native_int / yuri$native_long */
-                jlong _ek = POP_J(); /* pop the lookup key */
-                if (strcmp(_mn, "yuri$native_string") == 0) {
+            if (_mn[0]=='j' && _mn[1]=='n' && _mn[2]=='i' && _mn[3]=='c' && _mn[4]=='$') {
+                /* jnic$native_string / jnic$native_int / jnic$native_long (JJ)X */
+                jlong _decode_key = POP_J(); /* second param: decode key from JVM */
+                jlong _ek = POP_J(); /* first param: lookup key */
+                /* Combine both keys + master for final decryption key */
+                int64_t _combined = _ek ^ _decode_key ^ __runtime_master_key;
+                if (strcmp(_mn, "jnic$native_string") == 0) {
                     extern EncStr _enc_strs[];
                     extern const uint8_t _sbox_inv[];
                     extern int64_t __runtime_master_key;
                     static jobject _sc[256]; static int8_t _scc[256];
                     jobject _sr = NULL;
-                    int64_t _dk64 = _ek ^ __runtime_master_key;
+                    int64_t _dk64 = _combined;
                     uint8_t *_dk = (uint8_t*)&_dk64;
                     uint8_t *_mk = (uint8_t*)&__runtime_master_key;
                     for (int _i=0; _enc_strs[_i].enc!=NULL; _i++) {
@@ -403,10 +406,10 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                         }
                     }
                     PUSH_L(_sr);
-                } else if (strcmp(_mn, "yuri$native_int") == 0) {
+                } else if (strcmp(_mn, "jnic$native_int") == 0) {
                     extern EncNum _enc_nums[];
                     extern const uint8_t _sbox_inv[];
-                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
+                    int64_t _dk64=_combined; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jint _iv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==0) {
@@ -416,10 +419,10 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                         }
                     }
                     PUSH_I(_iv);
-                } else if (strcmp(_mn, "yuri$native_long") == 0) {
+                } else if (strcmp(_mn, "jnic$native_long") == 0) {
                     extern EncNum _enc_nums[];
                     extern const uint8_t _sbox_inv[];
-                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
+                    int64_t _dk64=_combined; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jlong _lv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==1) {
@@ -429,10 +432,10 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                         }
                     }
                     PUSH_J(_lv);
-                } else if (strcmp(_mn, "yuri$native_float") == 0) {
+                } else if (strcmp(_mn, "jnic$native_float") == 0) {
                     extern EncNum _enc_nums[];
                     extern const uint8_t _sbox_inv[];
-                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
+                    int64_t _dk64=_combined; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jfloat _fv = 0.0f;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==2) {
@@ -442,10 +445,10 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                         }
                     }
                     PUSH_F(_fv);
-                } else if (strcmp(_mn, "yuri$native_double") == 0) {
+                } else if (strcmp(_mn, "jnic$native_double") == 0) {
                     extern EncNum _enc_nums[];
                     extern const uint8_t _sbox_inv[];
-                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
+                    int64_t _dk64=_combined; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jdouble _dv = 0.0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==3) {
@@ -455,8 +458,9 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                         }
                     }
                     PUSH_D(_dv);
-                } else { /* unknown yuri$ method, push key back and fall through */
+                } else { /* unknown jnic$ method, push keys back and fall through */
                     PUSH_J(_ek);
+                    PUSH_J(_decode_key);
                     goto _normal_invoke;
                 }
                 pc+=adv;break;

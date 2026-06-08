@@ -341,10 +341,10 @@ fn isEncryptedNumberLookup(cp: []const types.CpInfo, idx: u16) bool {
 
 fn resolveEncryptedLookup(cp: []const types.CpInfo, idx: u16) ?EncryptedLookup {
     const ref = resolveMethodRef(cp, idx) orelse return null;
-    if (std.mem.eql(u8, ref.name, "yuri$native_int") and std.mem.eql(u8, ref.descriptor, "(J)I")) return .{ .kind = .int };
-    if (std.mem.eql(u8, ref.name, "yuri$native_long") and std.mem.eql(u8, ref.descriptor, "(J)J")) return .{ .kind = .long };
-    if (std.mem.eql(u8, ref.name, "yuri$native_float") and std.mem.eql(u8, ref.descriptor, "(J)F")) return .{ .kind = .float };
-    if (std.mem.eql(u8, ref.name, "yuri$native_double") and std.mem.eql(u8, ref.descriptor, "(J)D")) return .{ .kind = .double };
+    if (std.mem.eql(u8, ref.name, "jnic$native_int") and std.mem.eql(u8, ref.descriptor, "(J)I")) return .{ .kind = .int };
+    if (std.mem.eql(u8, ref.name, "jnic$native_long") and std.mem.eql(u8, ref.descriptor, "(J)J")) return .{ .kind = .long };
+    if (std.mem.eql(u8, ref.name, "jnic$native_float") and std.mem.eql(u8, ref.descriptor, "(J)F")) return .{ .kind = .float };
+    if (std.mem.eql(u8, ref.name, "jnic$native_double") and std.mem.eql(u8, ref.descriptor, "(J)D")) return .{ .kind = .double };
     return null;
 }
 
