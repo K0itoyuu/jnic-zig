@@ -397,7 +397,7 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
         const key_bytes: [8]u8 = @bitCast(s.key);
         for (s.value, 0..) |ch, i| {
             const enc = ch ^ key_bytes[i % 8];
-            try buf.print(allocator, "\\x{x:0>2}", .{enc});
+            try buf.print(allocator, "\\{o:0>3}", .{enc});
         }
         try buf.print(allocator, "\", {d}}},\n", .{s.value.len});
     }

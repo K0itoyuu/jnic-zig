@@ -76,6 +76,9 @@ static inline jmethodID _mid(JNIEnv *env, const JvmCpEntry *cp, JvmResolved *res
 }
 
 /* ===== Main interpreter ===== */
+#ifdef __GNUC__
+__attribute__((flatten,hot))
+#endif
 jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                      const jvalue *args, uint16_t arg_count, JvmRetType ret_type) {
     jvalue result; memset(&result,0,sizeof(result));
