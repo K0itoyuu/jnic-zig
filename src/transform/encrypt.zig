@@ -10,10 +10,17 @@ pub const EncryptedString = struct {
     class_name: []const u8,
 };
 
+pub const NumberKind = enum(u8) {
+    int = 0,
+    long = 1,
+    float = 2,
+    double = 3,
+};
+
 pub const EncryptedNumber = struct {
     key: i64,
     value: i64,
-    is_long: bool,
+    kind: NumberKind,
     class_name: []const u8,
 };
 
@@ -56,20 +63,31 @@ pub fn encryptConstants(allocator: std.mem.Allocator, cf: *types.ClassFile) !Enc
     const cp_yuri_str_name = try findOrAddUtf8(allocator, cf, "yuri$native_string");
     const cp_yuri_int_name = try findOrAddUtf8(allocator, cf, "yuri$native_int");
     const cp_yuri_long_name = try findOrAddUtf8(allocator, cf, "yuri$native_long");
+    const cp_yuri_float_name = try findOrAddUtf8(allocator, cf, "yuri$native_float");
+    const cp_yuri_double_name = try findOrAddUtf8(allocator, cf, "yuri$native_double");
     const cp_str_desc = try findOrAddUtf8(allocator, cf, "(J)Ljava/lang/String;");
     const cp_int_desc = try findOrAddUtf8(allocator, cf, "(J)I");
     const cp_long_desc = try findOrAddUtf8(allocator, cf, "(J)J");
+    const cp_float_desc = try findOrAddUtf8(allocator, cf, "(J)F");
+    const cp_double_desc = try findOrAddUtf8(allocator, cf, "(J)D");
     // NameAndType entries
     const cp_str_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_yuri_str_name, .descriptor_index = cp_str_desc } });
     const cp_int_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_yuri_int_name, .descriptor_index = cp_int_desc } });
     const cp_long_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_yuri_long_name, .descriptor_index = cp_long_desc } });
+    const cp_float_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_yuri_float_name, .descriptor_index = cp_float_desc } });
+    const cp_double_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_yuri_double_name, .descriptor_index = cp_double_desc } });
     // Methodref entries
     const cp_str_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_str_nat } });
     const cp_int_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_int_nat } });
     const cp_long_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_long_nat } });
+    const cp_float_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_float_nat } });
+    const cp_double_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_double_nat } });
 
     // Process each method
     for (cf.methods) |*method| {
+        const method_name = cf.getUtf8(method.name_index) orelse "";
+        if (std.mem.eql(u8, method_name, "<clinit>")) continue;
+
         const m_str = class_str_encrypt or hasAnnotation(cf, method.attributes, STRING_ENCRYPT_DESC);
         const m_num = class_num_encrypt or hasAnnotation(cf, method.attributes, NUMBER_ENCRYPT_DESC);
         if (!m_str and !m_num) continue;
@@ -82,7 +100,7 @@ pub fn encryptConstants(allocator: std.mem.Allocator, cf: *types.ClassFile) !Enc
             const attr_name = cf.getUtf8(attr.name_index) orelse continue;
             if (!std.mem.eql(u8, attr_name, "Code")) continue;
 
-            const new_code = try rewriteMethodCode(allocator, cf, attr.data, m_str, m_num, cp_str_ref, cp_int_ref, cp_long_ref, &strings, &numbers, class_name, &key_seed);
+            const new_code = try rewriteMethodCode(allocator, cf, attr.data, m_str, m_num, cp_str_ref, cp_int_ref, cp_long_ref, cp_float_ref, cp_double_ref, &strings, &numbers, class_name, &key_seed);
             if (new_code) |nc| {
                 method.attributes[ai] = .{ .name_index = attr.name_index, .data = nc };
             }
@@ -90,7 +108,7 @@ pub fn encryptConstants(allocator: std.mem.Allocator, cf: *types.ClassFile) !Enc
     }
 
     // Add synthetic native methods
-    var new_methods = try allocator.alloc(types.MethodInfo, cf.methods.len + 3);
+    var new_methods = try allocator.alloc(types.MethodInfo, cf.methods.len + 5);
     @memcpy(new_methods[0..cf.methods.len], cf.methods);
 
     // yuri$native_string(J)Ljava/lang/String;
@@ -107,6 +125,16 @@ pub fn encryptConstants(allocator: std.mem.Allocator, cf: *types.ClassFile) !Enc
     new_methods[cf.methods.len + 2] = .{
         .access_flags = types.ACC_PUBLIC | types.ACC_STATIC | types.ACC_NATIVE,
         .name_index = cp_yuri_long_name, .descriptor_index = cp_long_desc, .attributes = &.{},
+    };
+    // yuri$native_float(J)F
+    new_methods[cf.methods.len + 3] = .{
+        .access_flags = types.ACC_PUBLIC | types.ACC_STATIC | types.ACC_NATIVE,
+        .name_index = cp_yuri_float_name, .descriptor_index = cp_float_desc, .attributes = &.{},
+    };
+    // yuri$native_double(J)D
+    new_methods[cf.methods.len + 4] = .{
+        .access_flags = types.ACC_PUBLIC | types.ACC_STATIC | types.ACC_NATIVE,
+        .name_index = cp_yuri_double_name, .descriptor_index = cp_double_desc, .attributes = &.{},
     };
     cf.methods = new_methods;
 
@@ -126,6 +154,8 @@ fn rewriteMethodCode(
     str_ref: u16,
     int_ref: u16,
     long_ref: u16,
+    float_ref: u16,
+    double_ref: u16,
     strings: *std.ArrayList(EncryptedString),
     numbers: *std.ArrayList(EncryptedNumber),
     class_name: []const u8,
@@ -149,7 +179,7 @@ fn rewriteMethodCode(
         switch (op) {
             0x12 => { // ldc
                 const idx = @as(u16, code[pc + 1]);
-                if (try tryReplace(allocator, cf, idx, do_str, do_num, str_ref, int_ref, long_ref, strings, numbers, class_name, key_seed)) |rep| {
+                if (try tryReplace(allocator, cf, idx, do_str, do_num, str_ref, int_ref, long_ref, float_ref, double_ref, strings, numbers, class_name, key_seed)) |rep| {
                     var r = rep;
                     r.old_pc = pc;
                     r.old_len = 2;
@@ -159,7 +189,7 @@ fn rewriteMethodCode(
             },
             0x13 => { // ldc_w
                 const idx = readU16(code, pc + 1);
-                if (try tryReplace(allocator, cf, idx, do_str, do_num, str_ref, int_ref, long_ref, strings, numbers, class_name, key_seed)) |rep| {
+                if (try tryReplace(allocator, cf, idx, do_str, do_num, str_ref, int_ref, long_ref, float_ref, double_ref, strings, numbers, class_name, key_seed)) |rep| {
                     var r = rep;
                     r.old_pc = pc;
                     r.old_len = 3;
@@ -174,7 +204,7 @@ fn rewriteMethodCode(
                         switch (cf.constant_pool[idx]) {
                             .long => |v| {
                                 const key = nextKey(key_seed);
-                                try numbers.append(allocator, .{ .key = key, .value = v, .is_long = true, .class_name = class_name });
+                                try numbers.append(allocator, .{ .key = key, .value = v, .kind = .long, .class_name = class_name });
                                 const key_cp = try addCpEntry(allocator, cf, types.CpInfo{ .long = key });
                                 _ = try addCpEntry(allocator, cf, .long_continuation);
                                 var r = Replacement{ .old_pc = pc, .old_len = 3, .new_bytes = undefined, .new_len = 6 };
@@ -184,6 +214,21 @@ fn rewriteMethodCode(
                                 r.new_bytes[3] = 0xb8;
                                 r.new_bytes[4] = @intCast(long_ref >> 8);
                                 r.new_bytes[5] = @intCast(long_ref & 0xff);
+                                try replacements.append(allocator, r);
+                            },
+                            .double => |v| {
+                                const key = nextKey(key_seed);
+                                const bits: i64 = @bitCast(v);
+                                try numbers.append(allocator, .{ .key = key, .value = bits, .kind = .double, .class_name = class_name });
+                                const key_cp = try addCpEntry(allocator, cf, types.CpInfo{ .long = key });
+                                _ = try addCpEntry(allocator, cf, .long_continuation);
+                                var r = Replacement{ .old_pc = pc, .old_len = 3, .new_bytes = undefined, .new_len = 6 };
+                                r.new_bytes[0] = 0x14;
+                                r.new_bytes[1] = @intCast(key_cp >> 8);
+                                r.new_bytes[2] = @intCast(key_cp & 0xff);
+                                r.new_bytes[3] = 0xb8;
+                                r.new_bytes[4] = @intCast(double_ref >> 8);
+                                r.new_bytes[5] = @intCast(double_ref & 0xff);
                                 try replacements.append(allocator, r);
                             },
                             else => {},
@@ -262,12 +307,15 @@ fn tryReplace(
     str_ref: u16,
     int_ref: u16,
     long_ref: u16,
+    float_ref: u16,
+    double_ref: u16,
     strings: *std.ArrayList(EncryptedString),
     numbers: *std.ArrayList(EncryptedNumber),
     class_name: []const u8,
     key_seed: *u64,
 ) !?Replacement {
     _ = long_ref;
+    _ = double_ref;
     if (idx >= cf.constant_pool.len) return null;
 
     switch (cf.constant_pool[idx]) {
@@ -293,7 +341,7 @@ fn tryReplace(
         .integer => |v| {
             if (!do_num) return null;
             const key = nextKey(key_seed);
-            try numbers.append(allocator, .{ .key = key, .value = @as(i64, v), .is_long = false, .class_name = class_name });
+            try numbers.append(allocator, .{ .key = key, .value = @as(i64, v), .kind = .int, .class_name = class_name });
             const key_cp = try addCpEntry(allocator, cf, types.CpInfo{ .long = key });
             _ = try addCpEntry(allocator, cf, .long_continuation);
             var r = Replacement{ .new_len = 6 };
@@ -303,6 +351,23 @@ fn tryReplace(
             r.new_bytes[3] = 0xb8;
             r.new_bytes[4] = @intCast(int_ref >> 8);
             r.new_bytes[5] = @intCast(int_ref & 0xff);
+            return r;
+        },
+        .float => |v| {
+            if (!do_num) return null;
+            const key = nextKey(key_seed);
+            const bits_u: u32 = @bitCast(v);
+            const bits = @as(i64, @intCast(bits_u));
+            try numbers.append(allocator, .{ .key = key, .value = bits, .kind = .float, .class_name = class_name });
+            const key_cp = try addCpEntry(allocator, cf, types.CpInfo{ .long = key });
+            _ = try addCpEntry(allocator, cf, .long_continuation);
+            var r = Replacement{ .new_len = 6 };
+            r.new_bytes[0] = 0x14;
+            r.new_bytes[1] = @intCast(key_cp >> 8);
+            r.new_bytes[2] = @intCast(key_cp & 0xff);
+            r.new_bytes[3] = 0xb8;
+            r.new_bytes[4] = @intCast(float_ref >> 8);
+            r.new_bytes[5] = @intCast(float_ref & 0xff);
             return r;
         },
         else => return null,

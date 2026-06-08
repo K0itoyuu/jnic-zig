@@ -88,7 +88,7 @@ pub fn generateJniSource(
     try buf.appendSlice(allocator, @embedFile("jvm_interp.h"));
     try buf.appendSlice(allocator, "\n");
     try buf.appendSlice(allocator, @embedFile("jvm_interp.c"));
-    try buf.appendSlice(allocator, "\n\n");
+    try buf.appendSlice(allocator, "\n#include <math.h>\n\n");
 
     if (anti_debug) {
         try buf.appendSlice(allocator,
@@ -157,8 +157,8 @@ pub fn generateJniSource(
         var fnbuf: [32]u8 = undefined;
         const fn_name = names.funcName(&fnbuf, idx);
 
-        if (transpile.canTranspile(method.code_data)) {
-            try transpile.transpileMethod(allocator, &buf, method, fn_name);
+        if (transpile.canTranspile(method)) {
+            try transpile.transpileMethod(allocator, &buf, method, fn_name, enc_numbers);
         } else {
             try generateStub(allocator, &buf, method, idx, &names);
         }
@@ -314,6 +314,8 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
         \\
     );
 
+    try generateEncryptedRegistrations(allocator, buf, enc_strings, enc_numbers);
+
     for (methods, 0..) |method, idx| {
         var fnb: [32]u8 = undefined;
         const fn_name = names.funcName(&fnb, idx);
@@ -329,57 +331,6 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
         , .{ method.class_name, method.method_name, method.descriptor, fn_name });
     }
 
-    // Register encrypted constant lookup methods
-    if (enc_strings.len > 0 or enc_numbers.len > 0) {
-        // Collect unique class names that have encrypted constants
-        try buf.appendSlice(allocator,
-            \\    /* Register encrypted constant lookup methods */
-            \\
-        );
-        // We register for each unique class
-        var registered_classes: [64][]const u8 = undefined;
-        var num_registered: usize = 0;
-
-        for (enc_strings) |s| {
-            if (!classAlreadyRegistered(&registered_classes, num_registered, s.class_name)) {
-                if (num_registered < 64) { registered_classes[num_registered] = s.class_name; num_registered += 1; }
-                try buf.print(allocator,
-                    \\    {{
-                    \\        jclass cls = (*env)->FindClass(env, "{s}");
-                    \\        if (cls) {{
-                    \\            JNINativeMethod nms[] = {{
-                    \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_enc_str_lookup}},
-                    \\                {{"yuri$native_int", "(J)I", (void*)_enc_int_lookup}},
-                    \\                {{"yuri$native_long", "(J)J", (void*)_enc_long_lookup}}
-                    \\            }};
-                    \\            (*env)->RegisterNatives(env, cls, nms, 3);
-                    \\        }}
-                    \\    }}
-                    \\
-                , .{s.class_name});
-            }
-        }
-        for (enc_numbers) |n| {
-            if (!classAlreadyRegistered(&registered_classes, num_registered, n.class_name)) {
-                if (num_registered < 64) { registered_classes[num_registered] = n.class_name; num_registered += 1; }
-                try buf.print(allocator,
-                    \\    {{
-                    \\        jclass cls = (*env)->FindClass(env, "{s}");
-                    \\        if (cls) {{
-                    \\            JNINativeMethod nms[] = {{
-                    \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_enc_str_lookup}},
-                    \\                {{"yuri$native_int", "(J)I", (void*)_enc_int_lookup}},
-                    \\                {{"yuri$native_long", "(J)J", (void*)_enc_long_lookup}}
-                    \\            }};
-                    \\            (*env)->RegisterNatives(env, cls, nms, 3);
-                    \\        }}
-                    \\    }}
-                    \\
-                , .{n.class_name});
-            }
-        }
-    }
-
     try buf.appendSlice(allocator,
         \\    return JNI_VERSION_1_6;
         \\}
@@ -388,6 +339,61 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
 }
 
 // === Descriptor parsing helpers ===
+
+fn generateEncryptedRegistrations(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    enc_strings: []const encrypt_mod.EncryptedString,
+    enc_numbers: []const encrypt_mod.EncryptedNumber,
+) !void {
+    if (enc_strings.len == 0 and enc_numbers.len == 0) return;
+
+    try buf.appendSlice(allocator,
+        \\    /* Register encrypted constant lookup methods before class initialization can use them */
+        \\
+    );
+
+    var registered_classes: [64][]const u8 = undefined;
+    var num_registered: usize = 0;
+
+    for (enc_strings) |s| {
+        if (!classAlreadyRegistered(&registered_classes, num_registered, s.class_name)) {
+            if (num_registered < 64) {
+                registered_classes[num_registered] = s.class_name;
+                num_registered += 1;
+            }
+            try emitEncryptedRegistration(allocator, buf, s.class_name);
+        }
+    }
+    for (enc_numbers) |n| {
+        if (!classAlreadyRegistered(&registered_classes, num_registered, n.class_name)) {
+            if (num_registered < 64) {
+                registered_classes[num_registered] = n.class_name;
+                num_registered += 1;
+            }
+            try emitEncryptedRegistration(allocator, buf, n.class_name);
+        }
+    }
+}
+
+fn emitEncryptedRegistration(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), class_name: []const u8) !void {
+    try buf.print(allocator,
+        \\    {{
+        \\        jclass cls = (*env)->FindClass(env, "{s}");
+        \\        if (cls) {{
+        \\            JNINativeMethod nms[] = {{
+        \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_enc_str_lookup}},
+        \\                {{"yuri$native_int", "(J)I", (void*)_enc_int_lookup}},
+        \\                {{"yuri$native_long", "(J)J", (void*)_enc_long_lookup}},
+        \\                {{"yuri$native_float", "(J)F", (void*)_enc_float_lookup}},
+        \\                {{"yuri$native_double", "(J)D", (void*)_enc_double_lookup}}
+        \\            }};
+        \\            (*env)->RegisterNatives(env, cls, nms, 5);
+        \\        }}
+        \\    }}
+        \\
+    , .{class_name});
+}
 
 fn classAlreadyRegistered(list: []const []const u8, count: usize, name: []const u8) bool {
     for (list[0..count]) |n| { if (std.mem.eql(u8, n, name)) return true; }
@@ -416,7 +422,7 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
     try buf.print(allocator, "EncNum _enc_nums[] = {{\n", .{});
     for (enc_numbers) |n| {
         const enc_val = n.value ^ n.key;
-        try buf.print(allocator, "    {{{d}LL, {d}LL, {d}}},\n", .{ n.key, enc_val, @as(i8, if (n.is_long) 1 else 0) });
+        try buf.print(allocator, "    {{{d}LL, {d}LL, {d}}},\n", .{ n.key, enc_val, @intFromEnum(n.kind) });
     }
     try buf.appendSlice(allocator, "    {0, 0, 0}\n};\n\n");
 
@@ -456,7 +462,7 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
         \\JNIEXPORT jint JNICALL _enc_int_lookup(JNIEnv *env, jclass clazz, jlong key) {
         \\    (void)env; (void)clazz;
         \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
-        \\        if (_enc_nums[i].key == key && !_enc_nums[i].is_long) {
+        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 0) {
         \\            return (jint)(_enc_nums[i].enc_val ^ key);
         \\        }
         \\    }
@@ -471,7 +477,7 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
         \\JNIEXPORT jlong JNICALL _enc_long_lookup(JNIEnv *env, jclass clazz, jlong key) {
         \\    (void)env; (void)clazz;
         \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
-        \\        if (_enc_nums[i].key == key && _enc_nums[i].is_long) {
+        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 1) {
         \\            return (jlong)(_enc_nums[i].enc_val ^ key);
         \\        }
         \\    }
@@ -480,6 +486,121 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
         \\
         \\
     );
+
+    // Lookup function: yuri$native_float(long key) -> float
+    try buf.appendSlice(allocator,
+        \\JNIEXPORT jfloat JNICALL _enc_float_lookup(JNIEnv *env, jclass clazz, jlong key) {
+        \\    (void)env; (void)clazz;
+        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
+        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 2) {
+        \\            uint32_t bits = (uint32_t)(_enc_nums[i].enc_val ^ key);
+        \\            jfloat value;
+        \\            memcpy(&value, &bits, sizeof(value));
+        \\            return value;
+        \\        }
+        \\    }
+        \\    return 0.0f;
+        \\}
+        \\
+        \\
+    );
+
+    // Lookup function: yuri$native_double(long key) -> double
+    try buf.appendSlice(allocator,
+        \\JNIEXPORT jdouble JNICALL _enc_double_lookup(JNIEnv *env, jclass clazz, jlong key) {
+        \\    (void)env; (void)clazz;
+        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
+        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 3) {
+        \\            uint64_t bits = (uint64_t)(_enc_nums[i].enc_val ^ key);
+        \\            jdouble value;
+        \\            memcpy(&value, &bits, sizeof(value));
+        \\            return value;
+        \\        }
+        \\    }
+        \\    return 0.0;
+        \\}
+        \\
+        \\
+    );
+
+    try generateEncryptedLookupExports(allocator, buf, enc_strings, enc_numbers);
+}
+
+fn generateEncryptedLookupExports(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    enc_strings: []const encrypt_mod.EncryptedString,
+    enc_numbers: []const encrypt_mod.EncryptedNumber,
+) !void {
+    if (enc_strings.len == 0 and enc_numbers.len == 0) return;
+
+    try buf.appendSlice(allocator, "/* Standard JNI exports for encrypted lookup methods */\n");
+
+    var emitted_classes: [64][]const u8 = undefined;
+    var emitted_count: usize = 0;
+    for (enc_strings) |s| {
+        if (!classAlreadyRegistered(&emitted_classes, emitted_count, s.class_name)) {
+            if (emitted_count < 64) {
+                emitted_classes[emitted_count] = s.class_name;
+                emitted_count += 1;
+            }
+            try emitEncryptedLookupExportSet(allocator, buf, s.class_name);
+        }
+    }
+    for (enc_numbers) |n| {
+        if (!classAlreadyRegistered(&emitted_classes, emitted_count, n.class_name)) {
+            if (emitted_count < 64) {
+                emitted_classes[emitted_count] = n.class_name;
+                emitted_count += 1;
+            }
+            try emitEncryptedLookupExportSet(allocator, buf, n.class_name);
+        }
+    }
+}
+
+fn emitEncryptedLookupExportSet(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), class_name: []const u8) !void {
+    var mangled_class: std.ArrayList(u8) = .empty;
+    defer mangled_class.deinit(allocator);
+    try appendJniMangled(allocator, &mangled_class, class_name, true);
+
+    try buf.print(allocator,
+        \\JNIEXPORT jobject JNICALL Java_{s}_yuri_00024native_1string(JNIEnv *env, jclass clazz, jlong key) {{
+        \\    return _enc_str_lookup(env, clazz, key);
+        \\}}
+        \\JNIEXPORT jint JNICALL Java_{s}_yuri_00024native_1int(JNIEnv *env, jclass clazz, jlong key) {{
+        \\    return _enc_int_lookup(env, clazz, key);
+        \\}}
+        \\JNIEXPORT jlong JNICALL Java_{s}_yuri_00024native_1long(JNIEnv *env, jclass clazz, jlong key) {{
+        \\    return _enc_long_lookup(env, clazz, key);
+        \\}}
+        \\JNIEXPORT jfloat JNICALL Java_{s}_yuri_00024native_1float(JNIEnv *env, jclass clazz, jlong key) {{
+        \\    return _enc_float_lookup(env, clazz, key);
+        \\}}
+        \\JNIEXPORT jdouble JNICALL Java_{s}_yuri_00024native_1double(JNIEnv *env, jclass clazz, jlong key) {{
+        \\    return _enc_double_lookup(env, clazz, key);
+        \\}}
+        \\
+        \\
+    , .{
+        mangled_class.items,
+        mangled_class.items,
+        mangled_class.items,
+        mangled_class.items,
+        mangled_class.items,
+    });
+}
+
+fn appendJniMangled(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, slash_as_underscore: bool) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '/' => if (slash_as_underscore) try out.append(allocator, '_') else try out.appendSlice(allocator, "_2"),
+            '_' => try out.appendSlice(allocator, "_1"),
+            ';' => try out.appendSlice(allocator, "_2"),
+            '[' => try out.appendSlice(allocator, "_3"),
+            'A'...'Z', 'a'...'z', '0'...'9' => try out.append(allocator, ch),
+            else => try out.print(allocator, "_0{x:0>4}", .{ch}),
+        }
+    }
 }
 
 fn getReturnChar(desc: []const u8) u8 {

@@ -355,16 +355,38 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                     extern EncNum _enc_nums[];
                     jint _iv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
-                        if (_enc_nums[_i].key==_ek && !_enc_nums[_i].is_long) { _iv=(jint)(_enc_nums[_i].enc_val^_ek); break; }
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==0) { _iv=(jint)(_enc_nums[_i].enc_val^_ek); break; }
                     }
                     PUSH_I(_iv);
                 } else if (strcmp(_mn, "yuri$native_long") == 0) {
                     extern EncNum _enc_nums[];
                     jlong _lv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
-                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].is_long) { _lv=(jlong)(_enc_nums[_i].enc_val^_ek); break; }
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==1) { _lv=(jlong)(_enc_nums[_i].enc_val^_ek); break; }
                     }
                     PUSH_J(_lv);
+                } else if (strcmp(_mn, "yuri$native_float") == 0) {
+                    extern EncNum _enc_nums[];
+                    jfloat _fv = 0.0f;
+                    for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==2) {
+                            uint32_t _bits = (uint32_t)(_enc_nums[_i].enc_val^_ek);
+                            memcpy(&_fv, &_bits, sizeof(_fv));
+                            break;
+                        }
+                    }
+                    PUSH_F(_fv);
+                } else if (strcmp(_mn, "yuri$native_double") == 0) {
+                    extern EncNum _enc_nums[];
+                    jdouble _dv = 0.0;
+                    for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==3) {
+                            uint64_t _bits = (uint64_t)(_enc_nums[_i].enc_val^_ek);
+                            memcpy(&_dv, &_bits, sizeof(_dv));
+                            break;
+                        }
+                    }
+                    PUSH_D(_dv);
                 } else { /* unknown yuri$ method, push key back and fall through */
                     PUSH_J(_ek);
                     goto _normal_invoke;

@@ -2,9 +2,11 @@ const std = @import("std");
 const types = @import("../classfile/types.zig");
 const nativize = @import("../transform/nativize.zig");
 const cp_extract = @import("cp_extract.zig");
+const encrypt_mod = @import("../transform/encrypt.zig");
 
 /// Check if a method can be transpiled (pure computation, no JNI calls needed)
-pub fn canTranspile(code_data: []const u8) bool {
+pub fn canTranspile(method: nativize.ExtractedMethod) bool {
+    const code_data = method.code_data;
     if (code_data.len < 8) return false;
     const code_len = (@as(u32, code_data[4]) << 24) | (@as(u32, code_data[5]) << 16) |
         (@as(u32, code_data[6]) << 8) | @as(u32, code_data[7]);
@@ -25,6 +27,10 @@ pub fn canTranspile(code_data: []const u8) bool {
             => {},
             // ldc with int/float only (checked separately)
             0x12, 0x13 => {},
+            0xb8 => {
+                const idx = readU16(code, pc + 1);
+                if (!isEncryptedNumberLookup(method.class_cp, idx)) return false;
+            },
             else => return false, // anything else needs interpreter
         }
         pc += opcodeLen(code, pc, code_len);
@@ -37,9 +43,8 @@ pub fn transpileMethod(
     allocator: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     method: nativize.ExtractedMethod,
-    
     fn_name: []const u8,
-    
+    enc_numbers: []const encrypt_mod.EncryptedNumber,
 ) !void {
     const code_data = method.code_data;
     if (code_data.len < 8) return;
@@ -109,7 +114,7 @@ pub fn transpileMethod(
             try buf.print(allocator, "  L_{d}:\n", .{pc});
         }
 
-        try translateOpcode(allocator, buf, code, pc, code_len, class_cp, method);
+        try translateOpcode(allocator, buf, code, pc, code_len, class_cp, method, enc_numbers);
         pc += opcodeLen(code, pc, code_len);
     }
 
@@ -124,6 +129,7 @@ fn translateOpcode(
     code_len: u32,
     class_cp: []const types.CpInfo,
     method: nativize.ExtractedMethod,
+    enc_numbers: []const encrypt_mod.EncryptedNumber,
 ) !void {
     _ = code_len;
     _ = method;
@@ -204,22 +210,36 @@ fn translateOpcode(
         0x66 => try buf.appendSlice(allocator, "    {jfloat _b=*(jfloat*)&S[--sp],_a=*(jfloat*)&S[--sp]; *(jfloat*)&S[sp]=_a-_b;sp++;}\n"),
         0x6a => try buf.appendSlice(allocator, "    {jfloat _b=*(jfloat*)&S[--sp],_a=*(jfloat*)&S[--sp]; *(jfloat*)&S[sp]=_a*_b;sp++;}\n"),
         0x6e => try buf.appendSlice(allocator, "    {jfloat _b=*(jfloat*)&S[--sp],_a=*(jfloat*)&S[--sp]; *(jfloat*)&S[sp]=_a/_b;sp++;}\n"),
+        0x72 => try buf.appendSlice(allocator, "    {jfloat _b=*(jfloat*)&S[--sp],_a=*(jfloat*)&S[--sp]; *(jfloat*)&S[sp]=fmodf(_a,_b);sp++;}\n"),
+        0x76 => try buf.appendSlice(allocator, "    {jfloat _a=*(jfloat*)&S[sp-1]; *(jfloat*)&S[sp-1]=-_a;}\n"),
         0x63 => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; *(jdouble*)&S[sp]=_a+_b;sp+=2;}\n"),
         0x67 => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; *(jdouble*)&S[sp]=_a-_b;sp+=2;}\n"),
         0x6b => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; *(jdouble*)&S[sp]=_a*_b;sp+=2;}\n"),
         0x6f => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; *(jdouble*)&S[sp]=_a/_b;sp+=2;}\n"),
+        0x73 => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; *(jdouble*)&S[sp]=fmod(_a,_b);sp+=2;}\n"),
+        0x77 => try buf.appendSlice(allocator, "    {jdouble _a=*(jdouble*)&S[sp-2]; *(jdouble*)&S[sp-2]=-_a;}\n"),
         // Conversions
         0x85 => try buf.appendSlice(allocator, "    {jint _v=(jint)S[--sp]; S[sp]=(jlong)_v; sp+=2;}\n"), // i2l
         0x86 => try buf.appendSlice(allocator, "    {jint _v=(jint)S[sp-1]; *(jfloat*)&S[sp-1]=(jfloat)_v;}\n"), // i2f
         0x87 => try buf.appendSlice(allocator, "    {jint _v=(jint)S[--sp]; *(jdouble*)&S[sp]=(jdouble)_v; sp+=2;}\n"), // i2d
         0x88 => try buf.appendSlice(allocator, "    {sp-=2; S[sp]=(jlong)(jint)S[sp]; sp++;}\n"), // l2i
+        0x89 => try buf.appendSlice(allocator, "    {sp-=2; *(jfloat*)&S[sp]=(jfloat)S[sp]; sp++;}\n"), // l2f
+        0x8a => try buf.appendSlice(allocator, "    {sp-=2; *(jdouble*)&S[sp]=(jdouble)S[sp]; sp+=2;}\n"), // l2d
+        0x8b => try buf.appendSlice(allocator, "    {jfloat _v=*(jfloat*)&S[sp-1]; S[sp-1]=(jlong)(jint)_v;}\n"), // f2i
+        0x8c => try buf.appendSlice(allocator, "    {jfloat _v=*(jfloat*)&S[--sp]; S[sp]=(jlong)_v; sp+=2;}\n"), // f2l
+        0x8d => try buf.appendSlice(allocator, "    {jfloat _v=*(jfloat*)&S[--sp]; *(jdouble*)&S[sp]=(jdouble)_v; sp+=2;}\n"), // f2d
+        0x8e => try buf.appendSlice(allocator, "    {sp-=2; jdouble _v=*(jdouble*)&S[sp]; S[sp++]=(jlong)(jint)_v;}\n"), // d2i
+        0x8f => try buf.appendSlice(allocator, "    {sp-=2; jdouble _v=*(jdouble*)&S[sp]; S[sp]=(jlong)_v; sp+=2;}\n"), // d2l
+        0x90 => try buf.appendSlice(allocator, "    {sp-=2; jdouble _v=*(jdouble*)&S[sp]; *(jfloat*)&S[sp]=(jfloat)_v; sp++;}\n"), // d2f
         0x91 => try buf.appendSlice(allocator, "    S[sp-1]=(jlong)(jint)(int8_t)(jint)S[sp-1];\n"), // i2b
         0x92 => try buf.appendSlice(allocator, "    S[sp-1]=(jlong)(jint)(uint16_t)(jint)S[sp-1];\n"), // i2c
         0x93 => try buf.appendSlice(allocator, "    S[sp-1]=(jlong)(jint)(int16_t)(jint)S[sp-1];\n"), // i2s
         // Comparisons
         0x94 => try buf.appendSlice(allocator, "    {sp-=2;jlong _b=S[sp];sp-=2;jlong _a=S[sp]; S[sp++]=(jlong)(_a>_b?1:(_a<_b?-1:0));}\n"),
-        0x95, 0x96 => try buf.appendSlice(allocator, "    {jfloat _b=*(jfloat*)&S[--sp],_a=*(jfloat*)&S[--sp]; S[sp++]=(jlong)(_a>_b?1:(_a<_b?-1:(_a==_b?0:-1)));}\n"),
-        0x97, 0x98 => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; S[sp++]=(jlong)(_a>_b?1:(_a<_b?-1:(_a==_b?0:-1)));}\n"),
+        0x95 => try buf.appendSlice(allocator, "    {jfloat _b=*(jfloat*)&S[--sp],_a=*(jfloat*)&S[--sp]; S[sp++]=(jlong)(_a>_b?1:(_a<_b?-1:(_a==_b?0:-1)));}\n"),
+        0x96 => try buf.appendSlice(allocator, "    {jfloat _b=*(jfloat*)&S[--sp],_a=*(jfloat*)&S[--sp]; S[sp++]=(jlong)(_a>_b?1:(_a<_b?-1:(_a==_b?0:1)));}\n"),
+        0x97 => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; S[sp++]=(jlong)(_a>_b?1:(_a<_b?-1:(_a==_b?0:-1)));}\n"),
+        0x98 => try buf.appendSlice(allocator, "    {sp-=2;jdouble _b=*(jdouble*)&S[sp];sp-=2;jdouble _a=*(jdouble*)&S[sp]; S[sp++]=(jlong)(_a>_b?1:(_a<_b?-1:(_a==_b?0:1)));}\n"),
         // Branches
         0x99 => try buf.print(allocator, "    if((jint)S[--sp]==0) goto L_{d};\n", .{@as(i32, @intCast(pc)) + @as(i32, @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]))))}),
         0x9a => try buf.print(allocator, "    if((jint)S[--sp]!=0) goto L_{d};\n", .{@as(i32, @intCast(pc)) + @as(i32, @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]))))}),
@@ -245,7 +265,13 @@ fn translateOpcode(
         0xb0 => try buf.appendSlice(allocator, "    return (jobject)S[--sp];\n"),
         0xb1 => try buf.appendSlice(allocator, "    return;\n"),
         // Field/method access — fall through to JNI calls
-        0xb2...0xb9 => try emitJniCall(allocator, buf, code, pc),
+        0xb8 => {
+            const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+            if (!try emitEncryptedNumberLookup(allocator, buf, class_cp, idx, enc_numbers)) {
+                try emitJniCall(allocator, buf, code, pc);
+            }
+        },
+        0xb2...0xb7, 0xb9 => try emitJniCall(allocator, buf, code, pc),
         // ifnull/ifnonnull
         0xc6 => try buf.print(allocator, "    if(S[--sp]==0) goto L_{d};\n", .{@as(i32, @intCast(pc)) + @as(i32, @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]))))}),
         0xc7 => try buf.print(allocator, "    if(S[--sp]!=0) goto L_{d};\n", .{@as(i32, @intCast(pc)) + @as(i32, @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]))))}),
@@ -270,6 +296,85 @@ fn emitLdc2(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), cp: []const t
         .double => |v| try buf.print(allocator, "    *(jdouble*)&S[sp] = {d}; sp+=2;\n", .{v}),
         else => try buf.appendSlice(allocator, "    sp+=2;\n"),
     }
+}
+
+fn emitEncryptedNumberLookup(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    cp: []const types.CpInfo,
+    method_ref_idx: u16,
+    enc_numbers: []const encrypt_mod.EncryptedNumber,
+) !bool {
+    const lookup = resolveEncryptedLookup(cp, method_ref_idx) orelse return false;
+    try buf.appendSlice(allocator, "    sp-=2; /* encrypted constant key */\n");
+    try buf.appendSlice(allocator, "    {\n");
+    try buf.appendSlice(allocator, "        jlong _key = S[sp];\n");
+    try buf.appendSlice(allocator, "        switch (_key) {\n");
+    for (enc_numbers) |n| {
+        if (n.kind != lookup.kind) continue;
+        switch (n.kind) {
+            .int => try buf.print(allocator, "        case {d}LL: S[sp++] = (jlong)(jint){d}; break;\n", .{ n.key, @as(i32, @intCast(n.value)) }),
+            .long => try buf.print(allocator, "        case {d}LL: S[sp] = {d}LL; sp+=2; break;\n", .{ n.key, n.value }),
+            .float => {
+                const bits: u32 = @intCast(n.value);
+                try buf.print(allocator, "        case {d}LL: {{ uint32_t _bits = 0x{x:0>8}u; memcpy(&S[sp], &_bits, sizeof(_bits)); sp++; break; }}\n", .{ n.key, bits });
+            },
+            .double => {
+                const bits: u64 = @bitCast(n.value);
+                try buf.print(allocator, "        case {d}LL: {{ uint64_t _bits = 0x{x:0>16}ull; memcpy(&S[sp], &_bits, sizeof(_bits)); sp+=2; break; }}\n", .{ n.key, bits });
+            },
+        }
+    }
+    try buf.appendSlice(allocator, "        default: S[sp++] = 0; break;\n");
+    try buf.appendSlice(allocator, "        }\n");
+    try buf.appendSlice(allocator, "    }\n");
+    return true;
+}
+
+const EncryptedLookup = struct {
+    kind: encrypt_mod.NumberKind,
+};
+
+fn isEncryptedNumberLookup(cp: []const types.CpInfo, idx: u16) bool {
+    return resolveEncryptedLookup(cp, idx) != null;
+}
+
+fn resolveEncryptedLookup(cp: []const types.CpInfo, idx: u16) ?EncryptedLookup {
+    const ref = resolveMethodRef(cp, idx) orelse return null;
+    if (std.mem.eql(u8, ref.name, "yuri$native_int") and std.mem.eql(u8, ref.descriptor, "(J)I")) return .{ .kind = .int };
+    if (std.mem.eql(u8, ref.name, "yuri$native_long") and std.mem.eql(u8, ref.descriptor, "(J)J")) return .{ .kind = .long };
+    if (std.mem.eql(u8, ref.name, "yuri$native_float") and std.mem.eql(u8, ref.descriptor, "(J)F")) return .{ .kind = .float };
+    if (std.mem.eql(u8, ref.name, "yuri$native_double") and std.mem.eql(u8, ref.descriptor, "(J)D")) return .{ .kind = .double };
+    return null;
+}
+
+const MethodRefInfo = struct {
+    name: []const u8,
+    descriptor: []const u8,
+};
+
+fn resolveMethodRef(cp: []const types.CpInfo, idx: u16) ?MethodRefInfo {
+    if (idx >= cp.len) return null;
+    const nt_idx = switch (cp[idx]) {
+        .methodref => |r| r.name_and_type_index,
+        else => return null,
+    };
+    if (nt_idx >= cp.len) return null;
+    return switch (cp[nt_idx]) {
+        .name_and_type => |nt| .{
+            .name = getUtf8(cp, nt.name_index),
+            .descriptor = getUtf8(cp, nt.descriptor_index),
+        },
+        else => null,
+    };
+}
+
+fn getUtf8(cp: []const types.CpInfo, idx: u16) []const u8 {
+    if (idx >= cp.len) return "";
+    return switch (cp[idx]) {
+        .utf8 => |s| s,
+        else => "",
+    };
 }
 
 fn emitJniCall(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32) !void {
@@ -300,6 +405,11 @@ fn findBranchTargets(code: []const u8, code_len: u32, targets: *[4096]bool) void
 }
 
 // === Helpers ===
+fn readU16(code: []const u8, offset: u32) u16 {
+    if (offset + 1 >= code.len) return 0;
+    return (@as(u16, code[offset]) << 8) | @as(u16, code[offset + 1]);
+}
+
 fn getReturnChar(desc: []const u8) u8 {
     for (desc, 0..) |ch, i| { if (ch == ')' and i + 1 < desc.len) return desc[i + 1]; }
     return 'V';

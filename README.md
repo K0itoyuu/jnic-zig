@@ -135,6 +135,7 @@ zig build -Doptimize=ReleaseFast
 ### 纯计算方法（自动 Transpile 为 C）
 
 纯计算方法（无方法调用、无对象操作）被直接翻译为等价 C 代码，由 C 编译器 -O3 优化。
+`@NumberEncrypt` 加密后的 `int` / `long` / `float` / `double` 常量在 Transpile 路径中会被内联解密为 C 常量，不产生 JNI 回调开销。
 
 | 测试项 | Java JIT | Native (Transpile) | 比率 |
 |--------|----------|-------------------|------|
@@ -143,6 +144,16 @@ zig build -Doptimize=ReleaseFast
 | 位运算 (10M iter) | 18ms | **9ms** | **2x 更快** |
 | 嵌套循环 (1K×1K) | 4ms | **0ms** | **>4x 更快** |
 | **合计** | **62ms** | **16ms** | **3.9x 更快** |
+
+### Float / Double 纯计算（NumberEncrypt + Transpile）
+
+`FloatDoubleBench` 使用 `@Native + @NumberEncrypt`，保护后的 `float` / `double` 常量会先被抽取到 native 加密表，纯计算方法再由 Transpile 生成等价 C 代码。实测 Java JIT 热身后与 Native Transpile 接近，Native 略快；冷启动时 Native 更有优势。
+
+| 测试项 | Java JIT（热身后） | Native (Transpile) | 结论 |
+|--------|-------------------|-------------------|------|
+| Float 算术 (10M iter) | 约 11-13ms | **11ms** | 接近 |
+| Double 算术 (10M iter) | 约 12-15ms | **12ms** | 接近 |
+| **合计** | **约 24-28ms** | **23ms** | **Native 略快** |
 
 ### 混合方法（解释器 + JNI 回调）
 
@@ -158,7 +169,7 @@ zig build -Doptimize=ReleaseFast
 
 ### 加密常量访问
 
-`@StringEncrypt` / `@NumberEncrypt` 注解的常量在 native 层 XOR 加密存储，运行时直接在 C 层解密（零 JNI 开销）。
+`@StringEncrypt` / `@NumberEncrypt` 注解的常量在 native 层 XOR 加密存储。`@NumberEncrypt` 支持 `int`、`long`、`float`、`double`；纯计算 Transpile 方法会直接内联解密后的数值，解释器路径会通过 native lookup 解密。
 
 | 测试项 | Java JIT | Native (加密 + 解密) | 比率 |
 |--------|----------|---------------------|------|
@@ -175,6 +186,7 @@ zig build -Doptimize=ReleaseFast
 ## 注意事项
 
 - 纯计算方法自动使用 Transpile 模式（性能超越 JIT）
+- `@NumberEncrypt` 支持 `int` / `long` / `float` / `double`，但 `<clinit>` 中的静态初始化常量不会被改写，以避免 native 库加载阶段的注册时序问题
 - 含 JNI 调用的方法使用解释器模式（约 4-17x，取决于 JNI 调用密度）
 - 字符串拼接因 StringBuilder 预缓存优化，反而比 JIT 更快
 - `<init>`、`<clinit>` 不会被 native 化
