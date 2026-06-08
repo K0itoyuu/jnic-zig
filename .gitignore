@@ -1,0 +1,42 @@
+# Zig
+zig-out/
+.zig-cache/
+
+# Build outputs
+*.dll
+*.so
+*.dylib
+*.exe
+*.o
+*.obj
+
+# Generated files
+native_jni.c
+native_ffm.c
+NativeBindings.java
+out.jar
+output.jar
+input.jar
+run.bat
+run.sh
+
+# Temp directories
+.yurijvm_tmp_in/
+.yurijvm_tmp_out/
+
+# JVM crash logs
+hs_err_pid*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/bench (not part of the project)
+bench/
+tests/
+build/

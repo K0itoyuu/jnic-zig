@@ -1,0 +1,18 @@
+[jnic-zig]
+# 水印内容，用于追踪泄露
+watermark = "JNIC-zig"
+
+# 使用 FFM API (Java 22+) 代替 JNI native
+use_ffm = false
+
+# 开启反调试保护
+anti_debug = true
+
+# 开启符号随机化（DLL中的函数名、变量名、参数名）
+renamer = true
+
+# 输入JAR
+input_jar = "./input.jar"
+
+# 输出JAR
+output_jar = "./out.jar"
