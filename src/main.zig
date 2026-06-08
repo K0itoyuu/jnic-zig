@@ -272,19 +272,29 @@ const Reader = @import("util/reader.zig").Reader;
 
 /// Remove @Native annotation from class-level and method-level attributes
 fn removeNativeAnnotation(allocator: std.mem.Allocator, cf: *types.ClassFile) void {
-    const target_desc = "Lmaster/koitoyuu/Native;";
+    const targets = [_][]const u8{
+        "Lmaster/koitoyuu/Native;",
+        "Lmaster/koitoyuu/StringEncrypt;",
+        "Lmaster/koitoyuu/NumberEncrypt;",
+    };
 
     // Remove from class attributes
-    cf.attributes = filterAnnotationAttrs(allocator, cf, cf.attributes, target_desc);
+    for (targets) |target| {
+        cf.attributes = filterAnnotationAttrs(allocator, cf, cf.attributes, target);
+    }
 
     // Remove from method attributes
     for (cf.methods) |*method| {
-        method.attributes = filterAnnotationAttrs(allocator, cf, method.attributes, target_desc);
+        for (targets) |target| {
+            method.attributes = filterAnnotationAttrs(allocator, cf, method.attributes, target);
+        }
     }
 
-    // Remove from field attributes (just in case)
+    // Remove from field attributes
     for (cf.fields) |*field| {
-        field.attributes = filterAnnotationAttrs(allocator, cf, field.attributes, target_desc);
+        for (targets) |target| {
+            field.attributes = filterAnnotationAttrs(allocator, cf, field.attributes, target);
+        }
     }
 }
 
