@@ -62,6 +62,8 @@ const Names = struct {
 
 const encrypt_mod = @import("../transform/encrypt.zig");
 
+const transpile = @import("transpile.zig");
+
 pub fn generateJniSource(
     allocator: std.mem.Allocator,
     methods: []const nativize.ExtractedMethod,
@@ -139,20 +141,27 @@ pub fn generateJniSource(
     // Generate method contexts with resolution caches
     for (methods, 0..) |_, idx| {
         var vb: [32]u8 = undefined;
-        const vp = names.varPrefix(&vb, idx);
-        try buf.print(allocator, "static JvmResolved _r_{s}[{d}];\n", .{ vp, cp_entries_sizes.items[idx] });
+        const vp2 = names.varPrefix(&vb, idx);
+        try buf.print(allocator, "static JvmResolved _r_{s}[{d}];\n", .{ vp2, cp_entries_sizes.items[idx] });
     }
     try buf.appendSlice(allocator, "\n");
     for (methods, 0..) |_, idx| {
         var vb: [32]u8 = undefined;
-        const vp = names.varPrefix(&vb, idx);
-        try buf.print(allocator, "static JvmMethodCtx _m_{s} = {{_b_{s}, sizeof(_b_{s}), _c_{s}, _n_{s}, _r_{s}}};\n", .{ vp, vp, vp, vp, vp, vp });
+        const vp2 = names.varPrefix(&vb, idx);
+        try buf.print(allocator, "static JvmMethodCtx _m_{s} = {{_b_{s}, sizeof(_b_{s}), _c_{s}, _n_{s}, _r_{s}}};\n", .{ vp2, vp2, vp2, vp2, vp2, vp2 });
     }
     try buf.appendSlice(allocator, "\n");
 
-    // Generate native stubs
+    // Generate native stubs — transpile when possible, interpreter as fallback
     for (methods, 0..) |method, idx| {
-        try generateStub(allocator, &buf, method, idx, &names);
+        var fnbuf: [32]u8 = undefined;
+        const fn_name = names.funcName(&fnbuf, idx);
+
+        if (transpile.canTranspile(method.code_data)) {
+            try transpile.transpileMethod(allocator, &buf, method, fn_name);
+        } else {
+            try generateStub(allocator, &buf, method, idx, &names);
+        }
     }
 
     // Generate encrypted constant lookup functions (always emit tables, even if empty)
@@ -231,8 +240,8 @@ fn generateStub(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), method: n
     // Function signature
     var fnbuf: [32]u8 = undefined;
     const fn_name = names.funcName(&fnbuf, idx);
-    var vbuf2: [32]u8 = undefined;
-    const vp = names.varPrefix(&vbuf2, idx);
+    var vpbuf: [32]u8 = undefined;
+    const vp = names.varPrefix(&vpbuf, idx);
 
     try buf.print(allocator, "JNIEXPORT {s} JNICALL {s}(JNIEnv *env, {s}", .{
         jni_ret_type,
