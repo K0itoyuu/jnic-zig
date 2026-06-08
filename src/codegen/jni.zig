@@ -212,7 +212,7 @@ fn writeEscaped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []cons
             '\t' => try buf.appendSlice(allocator, "\\t"),
             else => {
                 if (c < 0x20) {
-                    try buf.print(allocator, "\\x{x:0>2}", .{c});
+                    try buf.print(allocator, "\\{o:0>3}", .{c});
                 } else {
                     try buf.append(allocator, c);
                 }

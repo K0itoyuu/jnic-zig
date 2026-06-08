@@ -386,24 +386,25 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
             char pt[64];int pn=_parse_args(md,pt,64);jvalue ma[64];
             for(int i=pn-1;i>=0;i--){switch(pt[i]){case'J':ma[i].j=POP_J();break;case'D':ma[i].d=POP_D();break;case'F':ma[i].f=POP_F();break;case'L':ma[i].l=POP_L();break;default:ma[i].i=POP_I();break;}}
             if(strcmp(nm,"makeConcatWithConstants")==0){
-                /* Direct String.concat approach */
-                static jclass _sc2=NULL; static jmethodID _scat2=NULL,_svo2=NULL;
-                if(!_sc2){_sc2=(*env)->NewGlobalRef(env,(*env)->FindClass(env,"java/lang/String"));
-                    _scat2=(*env)->GetMethodID(env,_sc2,"concat","(Ljava/lang/String;)Ljava/lang/String;");
-                    _svo2=(*env)->GetStaticMethodID(env,_sc2,"valueOf","(Ljava/lang/Object;)Ljava/lang/String;");}
+                /* Always use StringBuilder */
+                jobject sb = (*env)->NewObject(env, _sb_cls, _sb_init);
                 const char *recipe = cp[idx].data.indy.recipe;
-                jobject r = NULL;
                 int ai = 0;
                 if (recipe && recipe[0]) {
                     const char *p = recipe;
                     while (*p) {
-                        jobject seg = NULL;
                         if (*p == '\x01') {
                             if (ai < pn) {
                                 switch(pt[ai]){
-                                case'J':{char b[32];snprintf(b,32,"%lld",(long long)ma[ai].j);seg=(*env)->NewStringUTF(env,b);break;}
-                                case'L':seg=ma[ai].l?(*env)->CallStaticObjectMethod(env,_sc2,_svo2,ma[ai].l):(*env)->NewStringUTF(env,"null");break;
-                                default:{char b[32];snprintf(b,32,"%d",(int)ma[ai].i);seg=(*env)->NewStringUTF(env,b);break;}}
+                                case'J':(*env)->CallObjectMethod(env,sb,_sb_app_j,ma[ai].j);break;
+                                case'F':{jvalue fa;fa.d=(jdouble)ma[ai].f;(*env)->CallObjectMethod(env,sb,_sb_app_o,
+                                    (*env)->CallStaticObjectMethod(env,(*env)->FindClass(env,"java/lang/Float"),
+                                    (*env)->GetStaticMethodID(env,(*env)->FindClass(env,"java/lang/Float"),"valueOf","(F)Ljava/lang/Float;"),ma[ai].f));break;}
+                                case'D':(*env)->CallObjectMethod(env,sb,_sb_app_o,
+                                    (*env)->CallStaticObjectMethod(env,(*env)->FindClass(env,"java/lang/Double"),
+                                    (*env)->GetStaticMethodID(env,(*env)->FindClass(env,"java/lang/Double"),"valueOf","(D)Ljava/lang/Double;"),ma[ai].d));break;
+                                case'L':(*env)->CallObjectMethod(env,sb,_sb_app_s,(jstring)ma[ai].l);break;
+                                default:(*env)->CallObjectMethod(env,sb,_sb_app_i,ma[ai].i);break;}
                                 ai++;
                             }
                             p++;
@@ -412,17 +413,21 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                             while (*p && *p != '\x01') p++;
                             int slen=(int)(p-start);char tmp[512];int cl=slen<511?slen:511;
                             memcpy(tmp,start,cl);tmp[cl]=0;
-                            seg=(*env)->NewStringUTF(env,tmp);
+                            jstring lit=(*env)->NewStringUTF(env,tmp);
+                            (*env)->CallObjectMethod(env,sb,_sb_app_s,lit);
+                            (*env)->DeleteLocalRef(env,lit);
                         }
-                        if(seg){if(!r)r=seg;else{jobject nr=(*env)->CallObjectMethod(env,r,_scat2,seg);(*env)->DeleteLocalRef(env,seg);r=nr;}}
                     }
                 } else {
                     for(int i=0;i<pn;i++){
-                        jobject s2=ma[i].l?(*env)->CallStaticObjectMethod(env,_sc2,_svo2,ma[i].l):(*env)->NewStringUTF(env,"null");
-                        if(!r)r=s2;else{jobject nr=(*env)->CallObjectMethod(env,r,_scat2,s2);(*env)->DeleteLocalRef(env,s2);r=nr;}
+                        switch(pt[i]){
+                        case'J':(*env)->CallObjectMethod(env,sb,_sb_app_j,ma[i].j);break;
+                        case'L':(*env)->CallObjectMethod(env,sb,_sb_app_o,ma[i].l);break;
+                        default:(*env)->CallObjectMethod(env,sb,_sb_app_i,ma[i].i);break;}
                     }
                 }
-                if(!r)r=(*env)->NewStringUTF(env,"");
+                jobject r=(*env)->CallObjectMethod(env,sb,_sb_ts);
+                (*env)->DeleteLocalRef(env,sb);
                 PUSH_L(r);}
             else{char rc=_ret_ch(md);if(rc!='V')PUSH_L(NULL);}}
         CHK();pc+=5;break;}
