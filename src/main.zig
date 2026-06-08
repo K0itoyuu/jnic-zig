@@ -3,6 +3,7 @@ const config_mod = @import("config.zig");
 const parser = @import("classfile/parser.zig");
 const class_writer = @import("classfile/writer.zig");
 const nativize_mod = @import("transform/nativize.zig");
+const encrypt_mod = @import("transform/encrypt.zig");
 const jni = @import("codegen/jni.zig");
 const ffm = @import("codegen/ffm.zig");
 
@@ -65,13 +66,17 @@ pub fn main(init: std.process.Init) !void {
     // Process .class files
     var all_extracted: std.ArrayList(nativize_mod.ExtractedMethod) = .empty;
     defer all_extracted.deinit(allocator);
+    var all_enc_strings: std.ArrayList(encrypt_mod.EncryptedString) = .empty;
+    defer all_enc_strings.deinit(allocator);
+    var all_enc_numbers: std.ArrayList(encrypt_mod.EncryptedNumber) = .empty;
+    defer all_enc_numbers.deinit(allocator);
 
     var dir = Dir.cwd().openDir(io, tmp_in, .{ .iterate = true }) catch |err| {
         std.debug.print("Error opening temp dir: {}\n", .{err});
         return;
     };
     defer dir.close(io);
-    try processDirectory(allocator, io, dir, tmp_out, &all_extracted, config.remove_native_annotation);
+    try processDirectory(allocator, io, dir, tmp_out, &all_extracted, &all_enc_strings, &all_enc_numbers, config.remove_native_annotation);
 
     // Copy non-class files (META-INF, resources) from input to output
     copyNonClassFiles(allocator, io, tmp_in, tmp_out);
@@ -91,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
             Dir.cwd().writeFile(io, .{ .sub_path = "NativeBindings.java", .data = output.java_source }) catch {};
             std.debug.print("Generated: native_ffm.c, NativeBindings.java\n", .{});
         } else {
-            const c_source = try jni.generateJniSource(allocator, all_extracted.items, config.watermark, config.anti_debug, config.renamer);
+            const c_source = try jni.generateJniSource(allocator, all_extracted.items, config.watermark, config.anti_debug, config.renamer, all_enc_strings.items, all_enc_numbers.items);
             Dir.cwd().writeFile(io, .{ .sub_path = "native_jni.c", .data = c_source }) catch {};
             std.debug.print("Generated: native_jni.c\n", .{});
         }
@@ -189,6 +194,8 @@ fn processDirectory(
     dir: Dir,
     output_base: []const u8,
     extracted: *std.ArrayList(nativize_mod.ExtractedMethod),
+    enc_strings: *std.ArrayList(encrypt_mod.EncryptedString),
+    enc_numbers: *std.ArrayList(encrypt_mod.EncryptedNumber),
     remove_annotation: bool,
 ) !void {
     var walker = try Dir.walk(dir, allocator);
@@ -198,7 +205,7 @@ fn processDirectory(
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".class")) continue;
 
-        try processClassEntry(allocator, io, entry, output_base, extracted, remove_annotation);
+        try processClassEntry(allocator, io, entry, output_base, extracted, enc_strings, enc_numbers, remove_annotation);
     }
 }
 
@@ -208,6 +215,8 @@ fn processClassEntry(
     entry: Dir.Walker.Entry,
     output_base: []const u8,
     extracted: *std.ArrayList(nativize_mod.ExtractedMethod),
+    enc_strings: *std.ArrayList(encrypt_mod.EncryptedString),
+    enc_numbers: *std.ArrayList(encrypt_mod.EncryptedNumber),
     remove_annotation: bool,
 ) !void {
     const rel_path = entry.path;
@@ -221,6 +230,11 @@ fn processClassEntry(
         std.debug.print("  Parse error {s}: {}\n", .{ rel_path, err });
         return;
     };
+
+    // Apply string/number encryption (before nativize, so encrypted methods get native-ized too)
+    const enc_result = try encrypt_mod.encryptConstants(allocator, &cf);
+    for (enc_result.strings) |s| try enc_strings.append(allocator, s);
+    for (enc_result.numbers) |n| try enc_numbers.append(allocator, n);
 
     const result = try nativize_mod.nativize(allocator, &cf);
 
@@ -401,6 +415,7 @@ test {
     _ = @import("classfile/types.zig");
     _ = @import("classfile/annotations.zig");
     _ = @import("transform/nativize.zig");
+    _ = @import("transform/encrypt.zig");
     _ = @import("codegen/jni.zig");
     _ = @import("codegen/ffm.zig");
     _ = @import("codegen/cp_extract.zig");

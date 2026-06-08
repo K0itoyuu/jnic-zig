@@ -64,4 +64,8 @@ typedef struct {
 jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                      const jvalue *args, uint16_t arg_count, JvmRetType ret_type);
 
+/* Forward declarations for encrypted constant tables (defined in generated code) */
+typedef struct { int64_t key; const char *enc; int32_t len; } EncStr;
+typedef struct { int64_t key; int64_t enc_val; int8_t is_long; } EncNum;
+
 #endif

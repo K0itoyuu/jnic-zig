@@ -313,6 +313,50 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
     /* invoke */
     case 0xb6:case 0xb7:case 0xb8:case 0xb9:{
         uint16_t idx=RU16(c,pc+1);int is_s=(op==0xb8);int adv=(op==0xb9)?5:3;
+        /* Inline encrypted constant lookup for yuri$native_* methods */
+        if (is_s && idx<cpc && (cp[idx].tag==JVM_CP_METHODREF||cp[idx].tag==JVM_CP_IFACEREF)) {
+            const char *_mn = cp[idx].data.ref.name;
+            if (_mn[0]=='y' && _mn[1]=='u' && _mn[2]=='r' && _mn[3]=='i' && _mn[4]=='$') {
+                /* yuri$native_string / yuri$native_int / yuri$native_long */
+                jlong _ek = POP_J(); /* pop the key */
+                if (strcmp(_mn, "yuri$native_string") == 0) {
+                    extern EncStr _enc_strs[];
+                    jobject _sr = NULL;
+                    for (int _i=0; _enc_strs[_i].enc!=NULL; _i++) {
+                        if (_enc_strs[_i].key == _ek) {
+                            int32_t _sl = _enc_strs[_i].len;
+                            char *_dec = (char*)malloc(_sl+1);
+                            uint8_t *_kb = (uint8_t*)&_ek;
+                            for (int _j=0;_j<_sl;_j++) _dec[_j]=_enc_strs[_i].enc[_j]^_kb[_j%8];
+                            _dec[_sl]=0;
+                            _sr = (*env)->NewStringUTF(env, _dec);
+                            free(_dec);
+                            break;
+                        }
+                    }
+                    PUSH_L(_sr);
+                } else if (strcmp(_mn, "yuri$native_int") == 0) {
+                    extern EncNum _enc_nums[];
+                    jint _iv = 0;
+                    for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
+                        if (_enc_nums[_i].key==_ek && !_enc_nums[_i].is_long) { _iv=(jint)(_enc_nums[_i].enc_val^_ek); break; }
+                    }
+                    PUSH_I(_iv);
+                } else if (strcmp(_mn, "yuri$native_long") == 0) {
+                    extern EncNum _enc_nums[];
+                    jlong _lv = 0;
+                    for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].is_long) { _lv=(jlong)(_enc_nums[_i].enc_val^_ek); break; }
+                    }
+                    PUSH_J(_lv);
+                } else { /* unknown yuri$ method, push key back and fall through */
+                    PUSH_J(_ek);
+                    goto _normal_invoke;
+                }
+                pc+=adv;break;
+            }
+        }
+        _normal_invoke:;
         jmethodID mid=_mid(env,cp,res,idx,cpc,is_s);if(!mid){CHK();pc+=adv;break;}
         jclass mc=res[idx].clazz;const char*md=cp[idx].data.ref.descriptor;
         char pt[64];int pn=_parse_args(md,pt,64);jvalue ma[64];

@@ -60,12 +60,16 @@ const Names = struct {
     }
 };
 
+const encrypt_mod = @import("../transform/encrypt.zig");
+
 pub fn generateJniSource(
     allocator: std.mem.Allocator,
     methods: []const nativize.ExtractedMethod,
     watermark: []const u8,
     anti_debug: bool,
     renamer: bool,
+    enc_strings: []const encrypt_mod.EncryptedString,
+    enc_numbers: []const encrypt_mod.EncryptedNumber,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -151,8 +155,11 @@ pub fn generateJniSource(
         try generateStub(allocator, &buf, method, idx, &names);
     }
 
-    // Generate JNI_OnLoad
-    try generateOnLoad(allocator, &buf, methods, &names);
+    // Generate encrypted constant lookup functions (always emit tables, even if empty)
+    try generateEncryptedLookups(allocator, &buf, enc_strings, enc_numbers);
+
+    // Generate JNI_OnLoad (including encrypted lookup registrations)
+    try generateOnLoad(allocator, &buf, methods, &names, enc_strings, enc_numbers);
 
     return buf.toOwnedSlice(allocator);
 }
@@ -288,7 +295,7 @@ fn generateStub(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), method: n
     try buf.appendSlice(allocator, "}\n\n");
 }
 
-fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods: []const nativize.ExtractedMethod, names: *Names) !void {
+fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods: []const nativize.ExtractedMethod, names: *Names, enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber) !void {
     try buf.appendSlice(allocator,
         \\JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
         \\    JNIEnv *env;
@@ -313,6 +320,57 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
         , .{ method.class_name, method.method_name, method.descriptor, fn_name });
     }
 
+    // Register encrypted constant lookup methods
+    if (enc_strings.len > 0 or enc_numbers.len > 0) {
+        // Collect unique class names that have encrypted constants
+        try buf.appendSlice(allocator,
+            \\    /* Register encrypted constant lookup methods */
+            \\
+        );
+        // We register for each unique class
+        var registered_classes: [64][]const u8 = undefined;
+        var num_registered: usize = 0;
+
+        for (enc_strings) |s| {
+            if (!classAlreadyRegistered(&registered_classes, num_registered, s.class_name)) {
+                if (num_registered < 64) { registered_classes[num_registered] = s.class_name; num_registered += 1; }
+                try buf.print(allocator,
+                    \\    {{
+                    \\        jclass cls = (*env)->FindClass(env, "{s}");
+                    \\        if (cls) {{
+                    \\            JNINativeMethod nms[] = {{
+                    \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_enc_str_lookup}},
+                    \\                {{"yuri$native_int", "(J)I", (void*)_enc_int_lookup}},
+                    \\                {{"yuri$native_long", "(J)J", (void*)_enc_long_lookup}}
+                    \\            }};
+                    \\            (*env)->RegisterNatives(env, cls, nms, 3);
+                    \\        }}
+                    \\    }}
+                    \\
+                , .{s.class_name});
+            }
+        }
+        for (enc_numbers) |n| {
+            if (!classAlreadyRegistered(&registered_classes, num_registered, n.class_name)) {
+                if (num_registered < 64) { registered_classes[num_registered] = n.class_name; num_registered += 1; }
+                try buf.print(allocator,
+                    \\    {{
+                    \\        jclass cls = (*env)->FindClass(env, "{s}");
+                    \\        if (cls) {{
+                    \\            JNINativeMethod nms[] = {{
+                    \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_enc_str_lookup}},
+                    \\                {{"yuri$native_int", "(J)I", (void*)_enc_int_lookup}},
+                    \\                {{"yuri$native_long", "(J)J", (void*)_enc_long_lookup}}
+                    \\            }};
+                    \\            (*env)->RegisterNatives(env, cls, nms, 3);
+                    \\        }}
+                    \\    }}
+                    \\
+                , .{n.class_name});
+            }
+        }
+    }
+
     try buf.appendSlice(allocator,
         \\    return JNI_VERSION_1_6;
         \\}
@@ -321,6 +379,99 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
 }
 
 // === Descriptor parsing helpers ===
+
+fn classAlreadyRegistered(list: []const []const u8, count: usize, name: []const u8) bool {
+    for (list[0..count]) |n| { if (std.mem.eql(u8, n, name)) return true; }
+    return false;
+}
+
+fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber) !void {
+    // Generate XOR-encrypted string table
+    try buf.appendSlice(allocator, "\n/* === Encrypted constant tables === */\n");
+
+    // String table: key -> XOR-encrypted bytes
+    try buf.print(allocator, "EncStr _enc_strs[] = {{\n", .{});
+    for (enc_strings) |s| {
+        try buf.print(allocator, "    {{{d}LL, \"", .{s.key});
+        // XOR encrypt string with key bytes
+        const key_bytes: [8]u8 = @bitCast(s.key);
+        for (s.value, 0..) |ch, i| {
+            const enc = ch ^ key_bytes[i % 8];
+            try buf.print(allocator, "\\x{x:0>2}", .{enc});
+        }
+        try buf.print(allocator, "\", {d}}},\n", .{s.value.len});
+    }
+    try buf.appendSlice(allocator, "    {0, NULL, 0}\n};\n\n");
+
+    // Number table: key -> XOR-encrypted value
+    try buf.print(allocator, "EncNum _enc_nums[] = {{\n", .{});
+    for (enc_numbers) |n| {
+        const enc_val = n.value ^ n.key;
+        try buf.print(allocator, "    {{{d}LL, {d}LL, {d}}},\n", .{ n.key, enc_val, @as(i8, if (n.is_long) 1 else 0) });
+    }
+    try buf.appendSlice(allocator, "    {0, 0, 0}\n};\n\n");
+
+    // String lookup cache
+    try buf.print(allocator, "static jobject _str_cache[{d}];\n", .{@max(enc_strings.len, 1)});
+    try buf.appendSlice(allocator, "static int8_t _str_cached[" ++ "256];\n\n");
+
+    // Lookup function: yuri$native_string(long key) -> String
+    try buf.appendSlice(allocator,
+        \\JNIEXPORT jobject JNICALL _enc_str_lookup(JNIEnv *env, jclass clazz, jlong key) {
+        \\    (void)clazz;
+        \\    for (int i = 0; _enc_strs[i].enc != NULL; i++) {
+        \\        if (_enc_strs[i].key == key) {
+        \\            if (i < 256 && _str_cached[i]) return _str_cache[i];
+        \\            /* Decrypt: XOR with key bytes */
+        \\            int32_t len = _enc_strs[i].len;
+        \\            char *dec = (char*)malloc(len + 1);
+        \\            const char *enc = _enc_strs[i].enc;
+        \\            int64_t k = key;
+        \\            uint8_t *kb = (uint8_t*)&k;
+        \\            for (int j = 0; j < len; j++) dec[j] = enc[j] ^ kb[j % 8];
+        \\            dec[len] = 0;
+        \\            jstring result = (*env)->NewStringUTF(env, dec);
+        \\            free(dec);
+        \\            if (i < 256) { _str_cache[i] = (*env)->NewGlobalRef(env, result); _str_cached[i] = 1; }
+        \\            return result;
+        \\        }
+        \\    }
+        \\    return (*env)->NewStringUTF(env, "");
+        \\}
+        \\
+        \\
+    );
+
+    // Lookup function: yuri$native_int(long key) -> int
+    try buf.appendSlice(allocator,
+        \\JNIEXPORT jint JNICALL _enc_int_lookup(JNIEnv *env, jclass clazz, jlong key) {
+        \\    (void)env; (void)clazz;
+        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
+        \\        if (_enc_nums[i].key == key && !_enc_nums[i].is_long) {
+        \\            return (jint)(_enc_nums[i].enc_val ^ key);
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\
+    );
+
+    // Lookup function: yuri$native_long(long key) -> long
+    try buf.appendSlice(allocator,
+        \\JNIEXPORT jlong JNICALL _enc_long_lookup(JNIEnv *env, jclass clazz, jlong key) {
+        \\    (void)env; (void)clazz;
+        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
+        \\        if (_enc_nums[i].key == key && _enc_nums[i].is_long) {
+        \\            return (jlong)(_enc_nums[i].enc_val ^ key);
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\
+    );
+}
 
 fn getReturnChar(desc: []const u8) u8 {
     for (desc, 0..) |c, i| {
