@@ -164,6 +164,24 @@ pub fn generateJniSource(
 
     try buf.print(allocator, "static const char __watermark[] = \"{s}\";\n\n", .{watermark});
 
+    // Generate compile-time salt for dynamic key derivation
+    // Salt is unique per invocation (stack address as entropy)
+    var salt_src: u64 = undefined;
+    const compile_salt = @as(u64, @intFromPtr(&salt_src)) *% 0x517CC1B727220A95 ^ 0xDEADCAFEBEEF1234;
+    try buf.print(allocator, "const uint64_t __compile_salt = 0x{X}ULL;\n\n", .{compile_salt});
+
+    // Pre-compute master key (same formula as runtime) for encrypting values
+    var master_key: i64 = undefined;
+    {
+        var mk: u64 = compile_salt;
+        mk ^= mk >> 33;
+        mk *%= 0xFF51AFD7ED558CCD;
+        mk ^= mk >> 33;
+        mk *%= 0xC4CEB9FE1A85EC53;
+        mk ^= mk >> 33;
+        master_key = @bitCast(mk);
+    }
+
     // Generate bytecode arrays and CP arrays for each method
     var cp_entries_sizes: std.ArrayList(u32) = .empty;
     defer cp_entries_sizes.deinit(allocator);
@@ -222,7 +240,7 @@ pub fn generateJniSource(
     }
 
     // Generate encrypted constant lookup functions (always emit tables, even if empty)
-    try generateEncryptedLookups(allocator, &buf, enc_strings, enc_numbers);
+    try generateEncryptedLookups(allocator, &buf, enc_strings, enc_numbers, master_key);
 
     // Generate JNI_OnLoad (including encrypted lookup registrations)
     try generateOnLoad(allocator, &buf, methods, &names, enc_strings, enc_numbers, anti_debug);
@@ -371,7 +389,13 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
         \\
     );
 
-    // Call anti-debug in JNI_OnLoad
+    // Call runtime key init and anti-debug in JNI_OnLoad
+    try buf.appendSlice(allocator,
+        \\    __init_runtime_key();
+        \\
+        \\
+    );
+
     if (anti_debug) {
         try buf.appendSlice(allocator,
             \\    __anti_debug_check();
@@ -467,7 +491,7 @@ fn classAlreadyRegistered(list: []const []const u8, count: usize, name: []const 
     return false;
 }
 
-fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber) !void {
+fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber, master_key: i64) !void {
     // Generate XOR-encrypted string table
     try buf.appendSlice(allocator, "\n/* === Encrypted constant tables === */\n");
 
@@ -475,8 +499,9 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
     try buf.print(allocator, "EncStr _enc_strs[] = {{\n", .{});
     for (enc_strings) |s| {
         try buf.print(allocator, "    {{{d}LL, \"", .{s.key});
-        // XOR encrypt string with key bytes
-        const key_bytes: [8]u8 = @bitCast(s.key);
+        // XOR encrypt string with (key ^ master_key)
+        const derived_key = s.key ^ master_key;
+        const key_bytes: [8]u8 = @bitCast(derived_key);
         for (s.value, 0..) |ch, i| {
             const enc = ch ^ key_bytes[i % 8];
             try buf.print(allocator, "\\{o:0>3}", .{enc});
@@ -488,7 +513,7 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
     // Number table: key -> XOR-encrypted value
     try buf.print(allocator, "EncNum _enc_nums[] = {{\n", .{});
     for (enc_numbers) |n| {
-        const enc_val = n.value ^ n.key;
+        const enc_val = n.value ^ (n.key ^ master_key);
         try buf.print(allocator, "    {{{d}LL, {d}LL, {d}}},\n", .{ n.key, enc_val, @intFromEnum(n.kind) });
     }
     try buf.appendSlice(allocator, "    {0, 0, 0}\n};\n\n");

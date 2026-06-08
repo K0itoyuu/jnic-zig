@@ -5,6 +5,34 @@
 #include <string.h>
 #include <stdio.h>
 
+/* ===== Dynamic key derivation ===== */
+int64_t __runtime_master_key = 0;
+
+static uint32_t __crc32_bytes(const unsigned char *data, int len) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+    }
+    return ~crc;
+}
+
+void __init_runtime_key(void) {
+    /* Compile-time salt (unique per build, defined in generated code) */
+    extern const uint64_t __compile_salt;
+
+    /* Master key = hash of salt. Each build produces different salt → different key.
+       If binary is patched and anti-debug detects it, __ad_die() is called anyway. */
+    uint64_t mk = __compile_salt;
+    mk ^= mk >> 33;
+    mk *= 0xFF51AFD7ED558CCDULL;
+    mk ^= mk >> 33;
+    mk *= 0xC4CEB9FE1A85EC53ULL;
+    mk ^= mk >> 33;
+
+    __runtime_master_key = (int64_t)mk;
+}
+
 /* ===== Macros ===== */
 #define RU8(c,p)  ((uint8_t)(c)[(p)])
 #define RU16(c,p) ((uint16_t)(((uint8_t)(c)[(p)]<<8)|(uint8_t)(c)[(p)+1]))
@@ -347,7 +375,7 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
             const char *_mn = cp[idx].data.ref.name;
             if (_mn[0]=='y' && _mn[1]=='u' && _mn[2]=='r' && _mn[3]=='i' && _mn[4]=='$') {
                 /* yuri$native_string / yuri$native_int / yuri$native_long */
-                jlong _ek = POP_J(); /* pop the key */
+                jlong _ek = POP_J(); /* pop the lookup key */
                 if (strcmp(_mn, "yuri$native_string") == 0) {
                     extern EncStr _enc_strs[];
                     jobject _sr = NULL;
@@ -355,7 +383,9 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                         if (_enc_strs[_i].key == _ek) {
                             int32_t _sl = _enc_strs[_i].len;
                             char *_dec = (char*)malloc(_sl+1);
-                            uint8_t *_kb = (uint8_t*)&_ek;
+                            /* Decrypt: XOR with (key ^ runtime_master_key) */
+                            int64_t _dk = _ek ^ __runtime_master_key;
+                            uint8_t *_kb = (uint8_t*)&_dk;
                             for (int _j=0;_j<_sl;_j++) _dec[_j]=_enc_strs[_i].enc[_j]^_kb[_j%8];
                             _dec[_sl]=0;
                             _sr = (*env)->NewStringUTF(env, _dec);
@@ -368,14 +398,14 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                     extern EncNum _enc_nums[];
                     jint _iv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
-                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==0) { _iv=(jint)(_enc_nums[_i].enc_val^_ek); break; }
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==0) { _iv=(jint)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key)); break; }
                     }
                     PUSH_I(_iv);
                 } else if (strcmp(_mn, "yuri$native_long") == 0) {
                     extern EncNum _enc_nums[];
                     jlong _lv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
-                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==1) { _lv=(jlong)(_enc_nums[_i].enc_val^_ek); break; }
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==1) { _lv=(jlong)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key)); break; }
                     }
                     PUSH_J(_lv);
                 } else if (strcmp(_mn, "yuri$native_float") == 0) {
@@ -383,7 +413,7 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                     jfloat _fv = 0.0f;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==2) {
-                            uint32_t _bits = (uint32_t)(_enc_nums[_i].enc_val^_ek);
+                            uint32_t _bits = (uint32_t)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key));
                             memcpy(&_fv, &_bits, sizeof(_fv));
                             break;
                         }
@@ -394,7 +424,7 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                     jdouble _dv = 0.0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==3) {
-                            uint64_t _bits = (uint64_t)(_enc_nums[_i].enc_val^_ek);
+                            uint64_t _bits = (uint64_t)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key));
                             memcpy(&_dv, &_bits, sizeof(_dv));
                             break;
                         }

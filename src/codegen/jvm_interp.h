@@ -68,4 +68,10 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
 typedef struct { int64_t key; const char *enc; int32_t len; } EncStr;
 typedef struct { int64_t key; int64_t enc_val; int8_t kind; } EncNum;
 
+/* Dynamic key: derived at runtime from DLL base + code integrity CRC.
+   Stored keys in tables are XORed with this — useless without runtime execution. */
+extern int64_t __runtime_master_key;
+void __init_runtime_key(void);
+static inline int64_t __real_key(int64_t stored) { return stored ^ __runtime_master_key; }
+
 #endif
