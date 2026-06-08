@@ -473,11 +473,11 @@ fn emitEncryptedRegistration(allocator: std.mem.Allocator, buf: *std.ArrayList(u
         \\        jclass cls = (*env)->FindClass(env, "{s}");
         \\        if (cls) {{
         \\            JNINativeMethod nms[] = {{
-        \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_enc_str_lookup}},
-        \\                {{"yuri$native_int", "(J)I", (void*)_enc_int_lookup}},
-        \\                {{"yuri$native_long", "(J)J", (void*)_enc_long_lookup}},
-        \\                {{"yuri$native_float", "(J)F", (void*)_enc_float_lookup}},
-        \\                {{"yuri$native_double", "(J)D", (void*)_enc_double_lookup}}
+        \\                {{"yuri$native_string", "(J)Ljava/lang/String;", (void*)_ns}},
+        \\                {{"yuri$native_int", "(J)I", (void*)_ni}},
+        \\                {{"yuri$native_long", "(J)J", (void*)_nl}},
+        \\                {{"yuri$native_float", "(J)F", (void*)_nf}},
+        \\                {{"yuri$native_double", "(J)D", (void*)_nd}}
         \\            }};
         \\            (*env)->RegisterNatives(env, cls, nms, 5);
         \\        }}
@@ -492,195 +492,150 @@ fn classAlreadyRegistered(list: []const []const u8, count: usize, name: []const 
 }
 
 fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber, master_key: i64) !void {
-    // Generate XOR-encrypted string table
-    try buf.appendSlice(allocator, "\n/* === Encrypted constant tables === */\n");
+    try buf.appendSlice(allocator, "\n/* === Encrypted constants (multi-round cipher) === */\n");
 
-    // String table: key -> XOR-encrypted bytes
+    // Generate per-build S-Box from master_key (deterministic but unique per build)
+    var sbox: [256]u8 = undefined;
+    var sbox_inv: [256]u8 = undefined;
+    {
+        // Fisher-Yates shuffle seeded from master_key
+        for (0..256) |i| sbox[i] = @intCast(i);
+        var rng: u64 = @bitCast(master_key);
+        var i: usize = 255;
+        while (i > 0) : (i -= 1) {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng *%= 0x2545F4914F6CDD1D;
+            const j = rng % (i + 1);
+            const tmp = sbox[i];
+            sbox[i] = sbox[j];
+            sbox[j] = tmp;
+        }
+        // Compute inverse
+        for (0..256) |idx| sbox_inv[sbox[idx]] = @intCast(idx);
+    }
+
+    // Emit S-Box (static, not exported)
+    try buf.appendSlice(allocator, "const uint8_t _sbox[256] = {");
+    for (sbox, 0..) |v, i| {
+        if (i % 16 == 0) try buf.appendSlice(allocator, "\n    ");
+        try buf.print(allocator, "{d},", .{v});
+    }
+    try buf.appendSlice(allocator, "\n};\n");
+    try buf.appendSlice(allocator, "const uint8_t _sbox_inv[256] = {");
+    for (sbox_inv, 0..) |v, i| {
+        if (i % 16 == 0) try buf.appendSlice(allocator, "\n    ");
+        try buf.print(allocator, "{d},", .{v});
+    }
+    try buf.appendSlice(allocator, "\n};\n\n");
+
+    // Multi-round encrypt function (compile-time, in Zig)
+    // 4 rounds per byte: sbox[v] → rotate_left(3) → xor(round_key) → add(round_salt)
+    const mk_bytes: [8]u8 = @bitCast(master_key);
+
+    // String table with multi-round encrypted bytes
     try buf.print(allocator, "EncStr _enc_strs[] = {{\n", .{});
     for (enc_strings) |s| {
         try buf.print(allocator, "    {{{d}LL, \"", .{s.key});
-        // XOR encrypt string with (key ^ master_key)
-        const derived_key = s.key ^ master_key;
-        const key_bytes: [8]u8 = @bitCast(derived_key);
+        const dk: [8]u8 = @bitCast(s.key ^ master_key);
         for (s.value, 0..) |ch, i| {
-            const enc = ch ^ key_bytes[i % 8];
-            try buf.print(allocator, "\\{o:0>3}", .{enc});
+            var v: u8 = ch;
+            // 4 rounds of encryption
+            for (0..4) |round| {
+                v = sbox[v]; // substitution
+                v = (v << 3) | (v >> 5); // rotate left 3
+                v ^= dk[(@as(usize, i) + round) % 8]; // XOR with position-dependent key
+                v +%= mk_bytes[round % 8]; // modular add
+            }
+            try buf.print(allocator, "\\{o:0>3}", .{v});
         }
         try buf.print(allocator, "\", {d}}},\n", .{s.value.len});
     }
     try buf.appendSlice(allocator, "    {0, NULL, 0}\n};\n\n");
 
-    // Number table: key -> XOR-encrypted value
+    // Number table (multi-round on each byte of the value)
     try buf.print(allocator, "EncNum _enc_nums[] = {{\n", .{});
     for (enc_numbers) |n| {
-        const enc_val = n.value ^ (n.key ^ master_key);
+        const plain_bytes: [8]u8 = @bitCast(n.value);
+        const dk: [8]u8 = @bitCast(n.key ^ master_key);
+        var enc_bytes: [8]u8 = undefined;
+        for (0..8) |i| {
+            var v: u8 = plain_bytes[i];
+            for (0..4) |round| {
+                v = sbox[v];
+                v = (v << 3) | (v >> 5);
+                v ^= dk[(i + round) % 8];
+                v +%= mk_bytes[round % 8];
+            }
+            enc_bytes[i] = v;
+        }
+        const enc_val: i64 = @bitCast(enc_bytes);
         try buf.print(allocator, "    {{{d}LL, {d}LL, {d}}},\n", .{ n.key, enc_val, @intFromEnum(n.kind) });
     }
     try buf.appendSlice(allocator, "    {0, 0, 0}\n};\n\n");
 
-    // String lookup cache
+    // Cache for strings
     try buf.print(allocator, "static jobject _str_cache[{d}];\n", .{@max(enc_strings.len, 1)});
-    try buf.appendSlice(allocator, "static int8_t _str_cached[" ++ "256];\n\n");
+    try buf.appendSlice(allocator, "static int8_t _str_cached[256];\n\n");
 
-    // Lookup function: yuri$native_string(long key) -> String
+    // Static (non-exported) JNI stubs for yuri$native_* registration
+    // These use the same multi-round decrypt as the interpreter inline path
     try buf.appendSlice(allocator,
-        \\JNIEXPORT jobject JNICALL _enc_str_lookup(JNIEnv *env, jclass clazz, jlong key) {
-        \\    (void)clazz;
+        \\/* Internal decrypt — not exported, obfuscated name */
+        \\static uint8_t _db(uint8_t v, const uint8_t *dk, const uint8_t *mk, int pos) {
+        \\    for (int r = 3; r >= 0; r--) {
+        \\        v -= mk[r % 8];
+        \\        v ^= dk[(pos + r) % 8];
+        \\        v = (v >> 3) | (v << 5);
+        \\        v = _sbox_inv[v];
+        \\    }
+        \\    return v;
+        \\}
+        \\static jobject _ns(JNIEnv *env, jclass c, jlong key) {
+        \\    (void)c;
+        \\    int64_t dk64 = key ^ __runtime_master_key;
+        \\    uint8_t *dk = (uint8_t*)&dk64;
+        \\    uint8_t *mk = (uint8_t*)&__runtime_master_key;
         \\    for (int i = 0; _enc_strs[i].enc != NULL; i++) {
         \\        if (_enc_strs[i].key == key) {
         \\            if (i < 256 && _str_cached[i]) return _str_cache[i];
-        \\            /* Decrypt: XOR with key bytes */
         \\            int32_t len = _enc_strs[i].len;
-        \\            char *dec = (char*)malloc(len + 1);
-        \\            const char *enc = _enc_strs[i].enc;
-        \\            int64_t k = key;
-        \\            uint8_t *kb = (uint8_t*)&k;
-        \\            for (int j = 0; j < len; j++) dec[j] = enc[j] ^ kb[j % 8];
-        \\            dec[len] = 0;
-        \\            jstring result = (*env)->NewStringUTF(env, dec);
-        \\            free(dec);
-        \\            if (i < 256) { _str_cache[i] = (*env)->NewGlobalRef(env, result); _str_cached[i] = 1; }
-        \\            return result;
+        \\            char *d = (char*)malloc(len+1);
+        \\            for (int j=0;j<len;j++) d[j]=_db((uint8_t)_enc_strs[i].enc[j],dk,mk,j);
+        \\            d[len]=0;
+        \\            jstring r=(*env)->NewStringUTF(env,d); free(d);
+        \\            if(i<256){_str_cache[i]=(*env)->NewGlobalRef(env,r);_str_cached[i]=1;}
+        \\            return r;
         \\        }
         \\    }
-        \\    return (*env)->NewStringUTF(env, "");
+        \\    return (*env)->NewStringUTF(env,"");
         \\}
+        \\static jint _ni(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==0){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<4;j++)d[j]=_db(ev[j],dk,mk,j);jint r;memcpy(&r,d,4);return r;}}
+        \\    return 0;}
+        \\static jlong _nl(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==1){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dk,mk,j);jlong r;memcpy(&r,d,8);return r;}}
+        \\    return 0;}
+        \\static jfloat _nf(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==2){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[4];for(int j=0;j<4;j++)d[j]=_db(ev[j],dk,mk,j);jfloat r;memcpy(&r,d,4);return r;}}
+        \\    return 0.0f;}
+        \\static jdouble _nd(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+        \\    int64_t dk64=key^__runtime_master_key;uint8_t*dk=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==3){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dk,mk,j);jdouble r;memcpy(&r,d,8);return r;}}
+        \\    return 0.0;}
         \\
         \\
     );
-
-    // Lookup function: yuri$native_int(long key) -> int
-    try buf.appendSlice(allocator,
-        \\JNIEXPORT jint JNICALL _enc_int_lookup(JNIEnv *env, jclass clazz, jlong key) {
-        \\    (void)env; (void)clazz;
-        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
-        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 0) {
-        \\            return (jint)(_enc_nums[i].enc_val ^ key);
-        \\        }
-        \\    }
-        \\    return 0;
-        \\}
-        \\
-        \\
-    );
-
-    // Lookup function: yuri$native_long(long key) -> long
-    try buf.appendSlice(allocator,
-        \\JNIEXPORT jlong JNICALL _enc_long_lookup(JNIEnv *env, jclass clazz, jlong key) {
-        \\    (void)env; (void)clazz;
-        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
-        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 1) {
-        \\            return (jlong)(_enc_nums[i].enc_val ^ key);
-        \\        }
-        \\    }
-        \\    return 0;
-        \\}
-        \\
-        \\
-    );
-
-    // Lookup function: yuri$native_float(long key) -> float
-    try buf.appendSlice(allocator,
-        \\JNIEXPORT jfloat JNICALL _enc_float_lookup(JNIEnv *env, jclass clazz, jlong key) {
-        \\    (void)env; (void)clazz;
-        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
-        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 2) {
-        \\            uint32_t bits = (uint32_t)(_enc_nums[i].enc_val ^ key);
-        \\            jfloat value;
-        \\            memcpy(&value, &bits, sizeof(value));
-        \\            return value;
-        \\        }
-        \\    }
-        \\    return 0.0f;
-        \\}
-        \\
-        \\
-    );
-
-    // Lookup function: yuri$native_double(long key) -> double
-    try buf.appendSlice(allocator,
-        \\JNIEXPORT jdouble JNICALL _enc_double_lookup(JNIEnv *env, jclass clazz, jlong key) {
-        \\    (void)env; (void)clazz;
-        \\    for (int i = 0; _enc_nums[i].key != 0 || _enc_nums[i].enc_val != 0; i++) {
-        \\        if (_enc_nums[i].key == key && _enc_nums[i].kind == 3) {
-        \\            uint64_t bits = (uint64_t)(_enc_nums[i].enc_val ^ key);
-        \\            jdouble value;
-        \\            memcpy(&value, &bits, sizeof(value));
-        \\            return value;
-        \\        }
-        \\    }
-        \\    return 0.0;
-        \\}
-        \\
-        \\
-    );
-
-    try generateEncryptedLookupExports(allocator, buf, enc_strings, enc_numbers);
 }
 
-fn generateEncryptedLookupExports(
-    allocator: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    enc_strings: []const encrypt_mod.EncryptedString,
-    enc_numbers: []const encrypt_mod.EncryptedNumber,
-) !void {
-    if (enc_strings.len == 0 and enc_numbers.len == 0) return;
-
-    try buf.appendSlice(allocator, "/* Standard JNI exports for encrypted lookup methods */\n");
-
-    var emitted_classes: [64][]const u8 = undefined;
-    var emitted_count: usize = 0;
-    for (enc_strings) |s| {
-        if (!classAlreadyRegistered(&emitted_classes, emitted_count, s.class_name)) {
-            if (emitted_count < 64) {
-                emitted_classes[emitted_count] = s.class_name;
-                emitted_count += 1;
-            }
-            try emitEncryptedLookupExportSet(allocator, buf, s.class_name);
-        }
-    }
-    for (enc_numbers) |n| {
-        if (!classAlreadyRegistered(&emitted_classes, emitted_count, n.class_name)) {
-            if (emitted_count < 64) {
-                emitted_classes[emitted_count] = n.class_name;
-                emitted_count += 1;
-            }
-            try emitEncryptedLookupExportSet(allocator, buf, n.class_name);
-        }
-    }
-}
-
-fn emitEncryptedLookupExportSet(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), class_name: []const u8) !void {
-    var mangled_class: std.ArrayList(u8) = .empty;
-    defer mangled_class.deinit(allocator);
-    try appendJniMangled(allocator, &mangled_class, class_name, true);
-
-    try buf.print(allocator,
-        \\JNIEXPORT jobject JNICALL Java_{s}_yuri_00024native_1string(JNIEnv *env, jclass clazz, jlong key) {{
-        \\    return _enc_str_lookup(env, clazz, key);
-        \\}}
-        \\JNIEXPORT jint JNICALL Java_{s}_yuri_00024native_1int(JNIEnv *env, jclass clazz, jlong key) {{
-        \\    return _enc_int_lookup(env, clazz, key);
-        \\}}
-        \\JNIEXPORT jlong JNICALL Java_{s}_yuri_00024native_1long(JNIEnv *env, jclass clazz, jlong key) {{
-        \\    return _enc_long_lookup(env, clazz, key);
-        \\}}
-        \\JNIEXPORT jfloat JNICALL Java_{s}_yuri_00024native_1float(JNIEnv *env, jclass clazz, jlong key) {{
-        \\    return _enc_float_lookup(env, clazz, key);
-        \\}}
-        \\JNIEXPORT jdouble JNICALL Java_{s}_yuri_00024native_1double(JNIEnv *env, jclass clazz, jlong key) {{
-        \\    return _enc_double_lookup(env, clazz, key);
-        \\}}
-        \\
-        \\
-    , .{
-        mangled_class.items,
-        mangled_class.items,
-        mangled_class.items,
-        mangled_class.items,
-        mangled_class.items,
-    });
-}
 
 fn appendJniMangled(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, slash_as_underscore: bool) !void {
     for (s) |ch| {

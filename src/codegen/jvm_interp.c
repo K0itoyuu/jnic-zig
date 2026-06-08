@@ -378,55 +378,80 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
                 jlong _ek = POP_J(); /* pop the lookup key */
                 if (strcmp(_mn, "yuri$native_string") == 0) {
                     extern EncStr _enc_strs[];
+                    extern const uint8_t _sbox_inv[];
+                    extern int64_t __runtime_master_key;
+                    static jobject _sc[256]; static int8_t _scc[256];
                     jobject _sr = NULL;
+                    int64_t _dk64 = _ek ^ __runtime_master_key;
+                    uint8_t *_dk = (uint8_t*)&_dk64;
+                    uint8_t *_mk = (uint8_t*)&__runtime_master_key;
                     for (int _i=0; _enc_strs[_i].enc!=NULL; _i++) {
                         if (_enc_strs[_i].key == _ek) {
+                            if (_i < 256 && _scc[_i]) { _sr = _sc[_i]; break; }
                             int32_t _sl = _enc_strs[_i].len;
                             char *_dec = (char*)malloc(_sl+1);
-                            /* Decrypt: XOR with (key ^ runtime_master_key) */
-                            int64_t _dk = _ek ^ __runtime_master_key;
-                            uint8_t *_kb = (uint8_t*)&_dk;
-                            for (int _j=0;_j<_sl;_j++) _dec[_j]=_enc_strs[_i].enc[_j]^_kb[_j%8];
+                            for (int _j=0;_j<_sl;_j++) {
+                                uint8_t v = (uint8_t)_enc_strs[_i].enc[_j];
+                                for (int r=3;r>=0;r--) { v-=_mk[r%8]; v^=_dk[(_j+r)%8]; v=(v>>3)|(v<<5); v=_sbox_inv[v]; }
+                                _dec[_j] = v;
+                            }
                             _dec[_sl]=0;
                             _sr = (*env)->NewStringUTF(env, _dec);
                             free(_dec);
+                            if (_i<256){_sc[_i]=(*env)->NewGlobalRef(env,_sr);_scc[_i]=1;}
                             break;
                         }
                     }
                     PUSH_L(_sr);
                 } else if (strcmp(_mn, "yuri$native_int") == 0) {
                     extern EncNum _enc_nums[];
+                    extern const uint8_t _sbox_inv[];
+                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jint _iv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
-                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==0) { _iv=(jint)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key)); break; }
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==0) {
+                            uint8_t*ev=(uint8_t*)&_enc_nums[_i].enc_val; uint8_t d[4];
+                            for(int j=0;j<4;j++){uint8_t v=ev[j];for(int r=3;r>=0;r--){v-=_mk[r%8];v^=_dk[(j+r)%8];v=(v>>3)|(v<<5);v=_sbox_inv[v];}d[j]=v;}
+                            memcpy(&_iv,d,4); break;
+                        }
                     }
                     PUSH_I(_iv);
                 } else if (strcmp(_mn, "yuri$native_long") == 0) {
                     extern EncNum _enc_nums[];
+                    extern const uint8_t _sbox_inv[];
+                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jlong _lv = 0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
-                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==1) { _lv=(jlong)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key)); break; }
+                        if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==1) {
+                            uint8_t*ev=(uint8_t*)&_enc_nums[_i].enc_val; uint8_t d[8];
+                            for(int j=0;j<8;j++){uint8_t v=ev[j];for(int r=3;r>=0;r--){v-=_mk[r%8];v^=_dk[(j+r)%8];v=(v>>3)|(v<<5);v=_sbox_inv[v];}d[j]=v;}
+                            memcpy(&_lv,d,8); break;
+                        }
                     }
                     PUSH_J(_lv);
                 } else if (strcmp(_mn, "yuri$native_float") == 0) {
                     extern EncNum _enc_nums[];
+                    extern const uint8_t _sbox_inv[];
+                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jfloat _fv = 0.0f;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==2) {
-                            uint32_t _bits = (uint32_t)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key));
-                            memcpy(&_fv, &_bits, sizeof(_fv));
-                            break;
+                            uint8_t*ev=(uint8_t*)&_enc_nums[_i].enc_val; uint8_t d[4];
+                            for(int j=0;j<4;j++){uint8_t v=ev[j];for(int r=3;r>=0;r--){v-=_mk[r%8];v^=_dk[(j+r)%8];v=(v>>3)|(v<<5);v=_sbox_inv[v];}d[j]=v;}
+                            memcpy(&_fv,d,4); break;
                         }
                     }
                     PUSH_F(_fv);
                 } else if (strcmp(_mn, "yuri$native_double") == 0) {
                     extern EncNum _enc_nums[];
+                    extern const uint8_t _sbox_inv[];
+                    int64_t _dk64=_ek^__runtime_master_key; uint8_t*_dk=(uint8_t*)&_dk64; uint8_t*_mk=(uint8_t*)&__runtime_master_key;
                     jdouble _dv = 0.0;
                     for (int _i=0; _enc_nums[_i].key!=0||_enc_nums[_i].enc_val!=0; _i++) {
                         if (_enc_nums[_i].key==_ek && _enc_nums[_i].kind==3) {
-                            uint64_t _bits = (uint64_t)(_enc_nums[_i].enc_val^(_ek^__runtime_master_key));
-                            memcpy(&_dv, &_bits, sizeof(_dv));
-                            break;
+                            uint8_t*ev=(uint8_t*)&_enc_nums[_i].enc_val; uint8_t d[8];
+                            for(int j=0;j<8;j++){uint8_t v=ev[j];for(int r=3;r>=0;r--){v-=_mk[r%8];v^=_dk[(j+r)%8];v=(v>>3)|(v<<5);v=_sbox_inv[v];}d[j]=v;}
+                            memcpy(&_dv,d,8); break;
                         }
                     }
                     PUSH_D(_dv);
