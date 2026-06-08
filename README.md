@@ -144,7 +144,3 @@ zig build -Doptimize=ReleaseFast
 4. 使用本工具所产生的一切后果由使用者自行承担
 
 作者不对因使用本工具造成的任何直接或间接损失承担责任。使用本工具即表示您已阅读并同意上述条款。
-
-## License
-
-Private / All Rights Reserved
