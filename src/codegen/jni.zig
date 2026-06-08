@@ -94,11 +94,68 @@ pub fn generateJniSource(
         try buf.appendSlice(allocator,
             \\#ifdef _WIN32
             \\#include <windows.h>
-            \\static void __anti_debug_check(void) { if (IsDebuggerPresent()) ExitProcess(1); }
+            \\#include <winternl.h>
+            \\volatile int __ad_flag = 0;
+            \\void __ad_die(void) { ExitProcess(0xDEAD); }
+            \\void __anti_debug_check(void) {
+            \\    /* Check 1: IsDebuggerPresent */
+            \\    if (IsDebuggerPresent()) __ad_die();
+            \\    /* Check 2: PEB->BeingDebugged */
+            \\    PPEB peb = (PPEB)__readgsqword(0x60);
+            \\    if (peb->BeingDebugged) __ad_die();
+            \\    /* Check 3: NtQueryInformationProcess - DebugPort */
+            \\    typedef NTSTATUS(NTAPI*NtQIP)(HANDLE,ULONG,PVOID,ULONG,PULONG);
+            \\    NtQIP fn = (NtQIP)GetProcAddress(GetModuleHandleA("ntdll.dll"),"NtQueryInformationProcess");
+            \\    if (fn) { DWORD_PTR port = 0; fn(GetCurrentProcess(), 7, &port, sizeof(port), NULL); if (port) __ad_die(); }
+            \\    /* Check 4: Timing - detect single-stepping */
+            \\    LARGE_INTEGER f,t1,t2; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t1);
+            \\    volatile int x = 0; for(int i=0;i<100;i++) x+=i;
+            \\    QueryPerformanceCounter(&t2);
+            \\    if ((t2.QuadPart-t1.QuadPart)*1000/f.QuadPart > 50) __ad_die(); /* >50ms for trivial loop = debugger */
+            \\    __ad_flag = 1;
+            \\}
+            \\/* Check 5: Integrity - detect breakpoints (0xCC) on our functions */
+            \\void __ad_integrity(void *fn, int len) {
+            \\    unsigned char *p = (unsigned char*)fn;
+            \\    for (int i = 0; i < len && i < 64; i++) { if (p[i] == 0xCC) __ad_die(); }
+            \\}
             \\#else
             \\#include <sys/ptrace.h>
             \\#include <signal.h>
-            \\static void __anti_debug_check(void) { if (ptrace(PTRACE_TRACEME,0,0,0)==-1) raise(SIGKILL); }
+            \\#include <stdio.h>
+            \\#include <string.h>
+            \\#include <time.h>
+            \\volatile int __ad_flag = 0;
+            \\void __ad_die(void) { raise(SIGKILL); }
+            \\void __anti_debug_check(void) {
+            \\    /* Check 1: ptrace self-attach */
+            \\    if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) __ad_die();
+            \\    /* Check 2: /proc/self/status TracerPid */
+            \\    FILE *f = fopen("/proc/self/status", "r");
+            \\    if (f) {
+            \\        char line[256];
+            \\        while (fgets(line, sizeof(line), f)) {
+            \\            if (strncmp(line, "TracerPid:", 10) == 0) {
+            \\                int pid = atoi(line + 10);
+            \\                if (pid != 0) { fclose(f); __ad_die(); }
+            \\                break;
+            \\            }
+            \\        }
+            \\        fclose(f);
+            \\    }
+            \\    /* Check 3: Timing check */
+            \\    struct timespec t1, t2;
+            \\    clock_gettime(CLOCK_MONOTONIC, &t1);
+            \\    volatile int x = 0; for(int i=0;i<100;i++) x+=i;
+            \\    clock_gettime(CLOCK_MONOTONIC, &t2);
+            \\    long ns = (t2.tv_sec-t1.tv_sec)*1000000000L + (t2.tv_nsec-t1.tv_nsec);
+            \\    if (ns > 50000000) __ad_die(); /* >50ms = single-stepping */
+            \\    __ad_flag = 1;
+            \\}
+            \\void __ad_integrity(void *fn, int len) {
+            \\    unsigned char *p = (unsigned char*)fn;
+            \\    for (int i = 0; i < len && i < 64; i++) { if (p[i] == 0xCC) __ad_die(); }
+            \\}
             \\#endif
             \\
             \\
@@ -168,7 +225,7 @@ pub fn generateJniSource(
     try generateEncryptedLookups(allocator, &buf, enc_strings, enc_numbers);
 
     // Generate JNI_OnLoad (including encrypted lookup registrations)
-    try generateOnLoad(allocator, &buf, methods, &names, enc_strings, enc_numbers);
+    try generateOnLoad(allocator, &buf, methods, &names, enc_strings, enc_numbers, anti_debug);
 
     return buf.toOwnedSlice(allocator);
 }
@@ -304,7 +361,7 @@ fn generateStub(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), method: n
     try buf.appendSlice(allocator, "}\n\n");
 }
 
-fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods: []const nativize.ExtractedMethod, names: *Names, enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber) !void {
+fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods: []const nativize.ExtractedMethod, names: *Names, enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber, anti_debug: bool) !void {
     try buf.appendSlice(allocator,
         \\JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
         \\    JNIEnv *env;
@@ -313,6 +370,16 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
         \\
         \\
     );
+
+    // Call anti-debug in JNI_OnLoad
+    if (anti_debug) {
+        try buf.appendSlice(allocator,
+            \\    __anti_debug_check();
+            \\    __ad_integrity((void*)JNI_OnLoad, 32);
+            \\
+            \\
+        );
+    }
 
     try generateEncryptedRegistrations(allocator, buf, enc_strings, enc_numbers);
 

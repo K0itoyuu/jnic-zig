@@ -296,7 +296,20 @@ jvalue jvm_interpret(JNIEnv *env, const JvmMethodCtx *ctx,
     case 0xa4:{jint b=POP_I(),a=POP_I();if(a<=b)pc+=RI16(c,pc+1);else pc+=3;break;}
     case 0xa5:{jobject b=POP_L(),a=POP_L();if(a==b)pc+=RI16(c,pc+1);else pc+=3;break;}
     case 0xa6:{jobject b=POP_L(),a=POP_L();if(a!=b)pc+=RI16(c,pc+1);else pc+=3;break;}
-    case 0xa7:pc+=RI16(c,pc+1);break;
+    case 0xa7: { /* goto */
+        int16_t _off = RI16(c,pc+1);
+        pc += _off;
+        /* Periodic anti-debug on backward jumps (loops) */
+        if (_off < 0) {
+            static int __ad_counter = 0;
+            if (++__ad_counter >= 10000) {
+                __ad_counter = 0;
+                extern volatile int __ad_flag;
+                extern void __anti_debug_check(void);
+                if (__ad_flag) __anti_debug_check();
+            }
+        }
+        break; }
     case 0xc8:pc+=RI32(c,pc+1);break;
     case 0xaa:{uint32_t bp=pc;uint32_t pp=(pc+4)&~3u;int32_t def=RI32(c,pp);int32_t lo=RI32(c,pp+4);int32_t hi=RI32(c,pp+8);jint k=POP_I();if(k>=lo&&k<=hi)pc=bp+RI32(c,pp+12+(k-lo)*4);else pc=bp+def;break;}
     case 0xab:{uint32_t bp=pc;uint32_t pp=(pc+4)&~3u;int32_t def=RI32(c,pp);int32_t np=RI32(c,pp+4);jint k=POP_I();int32_t tgt=def;for(int32_t p=0;p<np;p++){if(k==RI32(c,pp+8+p*8)){tgt=RI32(c,pp+8+p*8+4);break;}}pc=bp+tgt;break;}
