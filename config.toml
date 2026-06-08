@@ -11,6 +11,9 @@ anti_debug = true
 # 开启符号随机化（DLL中的函数名、变量名、参数名）
 renamer = true
 
+# 混淆完成后删除字节码中的 @Native 注解
+remove_native_annotation = true
+
 # 输入JAR
 input_jar = "./input.jar"
 
