@@ -41,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  Anti-debug:  {}\n", .{config.anti_debug});
     std.debug.print("  Renamer:     {}\n", .{config.renamer});
     std.debug.print("  Remove anno: {}\n", .{config.remove_native_annotation});
+    std.debug.print("  Fast-math:   {}\n", .{config.fast_math});
     std.debug.print("  Input JAR:   {s}\n", .{config.input_jar});
     std.debug.print("  Output JAR:  {s}\n", .{config.output_jar});
 
@@ -132,7 +133,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  native_jni.c        - Native source (compile with zig cc)\n", .{});
         std.debug.print("  run.bat / run.sh    - Launch scripts\n", .{});
         std.debug.print("\nCompile native library:\n", .{});
-        std.debug.print("  zig cc -shared -o {s}.dll native_jni.c -I\"$JAVA_HOME/include\" -I\"$JAVA_HOME/include/win32\" -O2\n", .{lib_name});
+        const fmath_flag = if (config.fast_math) " -ffast-math" else "";
+        std.debug.print("  zig cc -shared -o {s}.dll native_jni.c -I\"$JAVA_HOME/include\" -I\"$JAVA_HOME/include/win32\" -O3{s}\n", .{ lib_name, fmath_flag });
         std.debug.print("\nIMPORTANT: Add System.loadLibrary(\"{s}\") to your main class,\n", .{lib_name});
         std.debug.print("           or use a java agent to load the native library.\n", .{});
     }

@@ -125,6 +125,7 @@ zig build -Doptimize=ReleaseFast
 | `anti_debug` | bool | `true` | 注入反调试检测代码 |
 | `renamer` | bool | `false` | 随机化 DLL 中的所有符号名（IDA 风格 `sub_180XXXXX`） |
 | `remove_native_annotation` | bool | `false` | 混淆后删除所有混淆注解 |
+| `fast_math` | bool | `false` | 启用 `-ffast-math` 浮点优化（SIMD 向量化，有微小精度差异） |
 | `input_jar` | string | `"./input.jar"` | 输入 JAR 路径 |
 | `output_jar` | string | `"./output.jar"` | 输出 JAR 路径 |
 
@@ -145,15 +146,17 @@ zig build -Doptimize=ReleaseFast
 | 嵌套循环 (1K×1K) | 4ms | **0ms** | **>4x 更快** |
 | **合计** | **62ms** | **16ms** | **3.9x 更快** |
 
-### Float / Double 纯计算（NumberEncrypt + Transpile）
+### Float / Double 纯计算（Transpile + fast_math）
 
-`FloatDoubleBench` 使用 `@Native + @NumberEncrypt`，保护后的 `float` / `double` 常量会先被抽取到 native 加密表，纯计算方法再由 Transpile 生成等价 C 代码。实测 Java JIT 热身后与 Native Transpile 接近，Native 略快；冷启动时 Native 更有优势。
+开启 `fast_math = true` 后，C 编译器可使用 SIMD/AVX 向量化浮点循环，性能远超 JIT。
 
-| 测试项 | Java JIT（热身后） | Native (Transpile) | 结论 |
-|--------|-------------------|-------------------|------|
-| Float 算术 (10M iter) | 约 11-13ms | **11ms** | 接近 |
-| Double 算术 (10M iter) | 约 12-15ms | **12ms** | 接近 |
-| **合计** | **约 24-28ms** | **23ms** | **Native 略快** |
+| 测试项 | Java JIT | Native `-O3` | Native `-O3 -ffast-math` | 比率 |
+|--------|----------|-------------|-------------------------|------|
+| Float 算术 (10M iter) | 12ms | 19ms | **1ms** | **12x 更快** |
+| Double 算术 (10M iter) | 13ms | 16ms | **1ms** | **13x 更快** |
+| **合计** | **25ms** | **35ms** | **2ms** | **12.5x 更快** |
+
+> 注意：`-ffast-math` 允许浮点运算重排，会产生微小精度差异（第7-8位有效数字），对绝大多数应用无影响。
 
 ### 混合方法（解释器 + JNI 回调）
 

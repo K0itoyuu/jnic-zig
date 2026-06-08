@@ -14,6 +14,9 @@ renamer = true
 # 混淆完成后删除字节码中的 @Native 注解
 remove_native_annotation = true
 
+# 启用 -ffast-math 浮点优化（允许 FP 重排以启用 SIMD 向量化，有微小精度差异）
+fast_math = true
+
 # 输入JAR
 input_jar = "./input.jar"
 
