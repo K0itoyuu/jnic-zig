@@ -40,7 +40,6 @@ public class PureBench {
     }
 
     public static void main(String[] args) {
-        System.loadLibrary("yurijvm_native");
         long t1 = System.currentTimeMillis();
         int r1 = intArith(10000000);
         t1 = System.currentTimeMillis() - t1;

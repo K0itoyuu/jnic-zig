@@ -7,7 +7,6 @@ import master.koitoyuu.jnic.NumberEncrypt;
 @NumberEncrypt
 public class NumBench {
     public static void main(String[] args) {
-        System.loadLibrary("yurijvm_native");
         run();
     }
 

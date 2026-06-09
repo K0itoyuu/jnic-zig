@@ -15,7 +15,6 @@ public class QuickTest {
     }
 
     public static void main(String[] args) {
-        System.loadLibrary("yurijvm_native");
         System.out.println("add(3,4) = " + add(3, 4));
         System.out.println("factorial(10) = " + factorial(10));
 

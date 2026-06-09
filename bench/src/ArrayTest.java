@@ -1,8 +1,8 @@
 import master.koitoyuu.jnic.Native;
-import master.koitoyuu.jnic.NumberEncrypt;
+import master.koitoyuu.jnic.ArrayObfuscation;
 
 @Native
-@NumberEncrypt
+@ArrayObfuscation
 public class ArrayTest {
     // This array has 16 elements → should trigger blob encryption
     private static final int[] SBOX = {

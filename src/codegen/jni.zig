@@ -234,13 +234,24 @@ pub fn generateJniSource(
     }
     try buf.appendSlice(allocator, "\n");
 
+    // Forward declarations for native array buffers (used by transpiled methods)
+    for (enc_arrays, 0..) |arr, idx| {
+        const c_type = switch (arr.elem_type) {
+            .int => "jint", .long => "jlong", .float => "jfloat",
+            .double => "jdouble", .byte => "jbyte", .short => "jshort",
+            .char => "jchar", .string => "void*",
+        };
+        try buf.print(allocator, "extern {s} _narr_{d}[];\n", .{ c_type, idx });
+    }
+    if (enc_arrays.len > 0) try buf.appendSlice(allocator, "\n");
+
     // Generate native stubs — transpile when possible, interpreter as fallback
     for (methods, 0..) |method, idx| {
         var fnbuf: [32]u8 = undefined;
         const fn_name = names.funcName(&fnbuf, idx);
 
         if (transpile.canTranspile(method)) {
-            try transpile.transpileMethod(allocator, &buf, method, fn_name, enc_numbers);
+            try transpile.transpileMethod(allocator, &buf, method, fn_name, enc_numbers, enc_arrays);
         } else {
             try generateStub(allocator, &buf, method, idx, &names);
         }
@@ -413,7 +424,7 @@ fn generateArrayBlobs(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc
             .double => "jdouble", .byte => "jbyte", .short => "jshort",
             .char => "jchar", .string => "void*",
         };
-        try buf.print(allocator, "static {s} _narr_{d}[{d}];\nstatic int _narr_{d}_ok = 0;\n", .{ c_elem_type, idx, arr.length, idx });
+        try buf.print(allocator, "{s} _narr_{d}[{d}];\nstatic int _narr_{d}_ok = 0;\n", .{ c_elem_type, idx, arr.length, idx });
 
         // Generate native function: decrypts blob, caches in C buffer, returns JNI array
         const jni_arr_type = switch (arr.elem_type) {
@@ -514,6 +525,35 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
         );
     }
 
+    // Register array native methods FIRST (before any FindClass triggers <clinit>)
+    if (enc_arrays.len > 0) {
+        var arr_classes: [64][]const u8 = undefined;
+        var num_arr_classes: usize = 0;
+        for (enc_arrays) |arr| {
+            var found = false;
+            for (0..num_arr_classes) |ci| {
+                if (std.mem.eql(u8, arr_classes[ci], arr.class_name)) { found = true; break; }
+            }
+            if (!found and num_arr_classes < 64) {
+                arr_classes[num_arr_classes] = arr.class_name;
+                num_arr_classes += 1;
+            }
+        }
+        for (0..num_arr_classes) |ci| {
+            try buf.print(allocator, "    {{\n        jclass cls = (*env)->FindClass(env, \"{s}\");\n        if (cls) {{\n            JNINativeMethod nms[] = {{\n", .{arr_classes[ci]});
+            var acount: usize = 0;
+            var per_class_idx: usize = 0;
+            for (enc_arrays, 0..) |arr, aidx| {
+                if (!std.mem.eql(u8, arr.class_name, arr_classes[ci])) continue;
+                const desc = array_encrypt_mod.arrayMethodDesc(arr.elem_type);
+                try buf.print(allocator, "                {{\"jnic$arr${d}\", \"{s}\", (void*)_arr_f{d}}},\n", .{ per_class_idx, desc, aidx });
+                acount += 1;
+                per_class_idx += 1;
+            }
+            try buf.print(allocator, "            }};\n            (*env)->RegisterNatives(env, cls, nms, {d});\n        }}\n    }}\n", .{acount});
+        }
+    }
+
     try generateEncryptedRegistrations(allocator, buf, enc_strings, enc_numbers, enc_mode);
 
     // Group methods by class and batch RegisterNatives
@@ -547,34 +587,6 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
             count += 1;
         }
         try buf.print(allocator, "            }};\n            (*env)->RegisterNatives(env, cls, nms, {d});\n        }}\n    }}\n", .{count});
-    }
-
-    // Register encrypted array native methods
-    if (enc_arrays.len > 0) {
-        // Group arrays by class
-        var arr_classes: [64][]const u8 = undefined;
-        var num_arr_classes: usize = 0;
-        for (enc_arrays) |arr| {
-            var found = false;
-            for (0..num_arr_classes) |ci| {
-                if (std.mem.eql(u8, arr_classes[ci], arr.class_name)) { found = true; break; }
-            }
-            if (!found and num_arr_classes < 64) {
-                arr_classes[num_arr_classes] = arr.class_name;
-                num_arr_classes += 1;
-            }
-        }
-        for (0..num_arr_classes) |ci| {
-            try buf.print(allocator, "    {{\n        jclass cls = (*env)->FindClass(env, \"{s}\");\n        if (cls) {{\n            JNINativeMethod nms[] = {{\n", .{arr_classes[ci]});
-            var acount: usize = 0;
-            for (enc_arrays, 0..) |arr, aidx| {
-                if (!std.mem.eql(u8, arr.class_name, arr_classes[ci])) continue;
-                const desc = array_encrypt_mod.arrayMethodDesc(arr.elem_type);
-                try buf.print(allocator, "                {{\"jnic$arr${d}\", \"{s}\", (void*)_arr_f{d}}},\n", .{ aidx, desc, aidx });
-                acount += 1;
-            }
-            try buf.print(allocator, "            }};\n            (*env)->RegisterNatives(env, cls, nms, {d});\n        }}\n    }}\n", .{acount});
-        }
     }
 
     try buf.appendSlice(allocator,

@@ -121,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
         Dir.cwd().deleteFile(io, anno_base ++ "/Native.class") catch {};
         Dir.cwd().deleteFile(io, anno_base ++ "/StringEncrypt.class") catch {};
         Dir.cwd().deleteFile(io, anno_base ++ "/NumberEncrypt.class") catch {};
+        Dir.cwd().deleteFile(io, anno_base ++ "/ArrayObfuscation.class") catch {};
         // Also remove old-package annotation files if present
         const old_base = tmp_out ++ "/master/koitoyuu";
         Dir.cwd().deleteFile(io, old_base ++ "/Native.class") catch {};
@@ -268,7 +269,7 @@ fn processClassEntry(
     for (enc_result.numbers) |n| try enc_numbers.append(allocator, n);
 
     // Apply array encryption (large arrays → blob, before nativize)
-    const arr_result = try array_encrypt_mod.encryptArrays(allocator, &cf);
+    const arr_result = try array_encrypt_mod.encryptArrays(allocator, &cf, enchanted);
     for (arr_result.arrays) |a| try enc_arrays.append(allocator, a);
 
     const result = try nativize_mod.nativize(allocator, &cf);
@@ -311,6 +312,7 @@ fn removeNativeAnnotation(allocator: std.mem.Allocator, cf: *types.ClassFile) vo
         "Lmaster/koitoyuu/jnic/Native;",
         "Lmaster/koitoyuu/jnic/StringEncrypt;",
         "Lmaster/koitoyuu/jnic/NumberEncrypt;",
+        "Lmaster/koitoyuu/jnic/ArrayObfuscation;",
     };
 
     // Remove from class attributes

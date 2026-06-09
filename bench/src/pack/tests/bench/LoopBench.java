@@ -5,7 +5,6 @@ import master.koitoyuu.jnic.Native;
 @Native
 public class LoopBench {
     public static void main(String[] args) {
-        System.loadLibrary("yurijvm_native");
         runAll();
     }
 

@@ -68,12 +68,15 @@ pub fn canTranspile(method: nativize.ExtractedMethod) bool {
 }
 
 /// Transpile a method to C code
+const array_encrypt_mod = @import("../transform/array_encrypt.zig");
+
 pub fn transpileMethod(
     allocator: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     method: nativize.ExtractedMethod,
     fn_name: []const u8,
     enc_numbers: []const encrypt_mod.EncryptedNumber,
+    enc_arrays: []const array_encrypt_mod.EncryptedArray,
 ) !void {
     const code_data = method.code_data;
     if (code_data.len < 8) return;
@@ -157,7 +160,37 @@ pub fn transpileMethod(
             try buf.print(allocator, "  L_{d}:\n", .{pc});
         }
 
-        try translateOpcode(allocator, buf, code, pc, code_len, class_cp, method, enc_numbers, &method_idx);
+        // Optimize: getstatic BLOB_ARRAY + [index_push] + iaload/laload → direct C array access
+        if (code[pc] == 0xb2 and pc + 3 < code_len) { // getstatic
+            const field_idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+            const arr_idx = findBlobArrayByField(class_cp, field_idx, enc_arrays, method.class_name);
+            if (arr_idx) |aidx| {
+                const next_pc = pc + 3;
+                const idx_len = valuePushLenForTranspile(code, next_pc, code_len);
+                if (idx_len > 0) {
+                    const store_pc = next_pc + idx_len;
+                    if (store_pc < code_len and isArrayLoad(code[store_pc])) {
+                        // Emit: direct native array access
+                        const et = enc_arrays[aidx].elem_type;
+                        const is_wide = (et == .long or et == .double);
+                        try buf.print(allocator, "    {{ jint _idx=", .{});
+                        try emitIndexExpr(allocator, buf, code, next_pc);
+                        if (is_wide) {
+                            // long/double: 2 stack slots
+                            const c_type = if (et == .long) "jlong" else "jdouble";
+                            try buf.print(allocator, "; *({s}*)&S[sp]=_narr_{d}[_idx]; sp+=2; }}\n", .{ c_type, aidx });
+                        } else {
+                            // int/byte/short/char/float: 1 stack slot
+                            try buf.print(allocator, "; S[sp++]=(jlong)(jint)_narr_{d}[_idx]; }}\n", .{aidx});
+                        }
+                        pc = store_pc + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        try translateOpcode(allocator, buf, code, pc, code_len, class_cp, method, enc_numbers, enc_arrays, &method_idx);
         pc += opcodeLen(code, pc, code_len);
     }
 
@@ -173,8 +206,10 @@ fn translateOpcode(
     class_cp: []const types.CpInfo,
     method: nativize.ExtractedMethod,
     enc_numbers: []const encrypt_mod.EncryptedNumber,
+    enc_arrays: []const array_encrypt_mod.EncryptedArray,
     method_idx: *u32,
 ) !void {
+    _ = enc_arrays;
     _ = code_len;
     _ = method;
     const op = code[pc];
@@ -969,4 +1004,63 @@ fn opcodeLen(code: []const u8, pc: u32, code_len: u32) u32 {
         0xc4 => if (pc + 1 < code_len and code[pc + 1] == 0x84) 6 else 4,
         else => 1,
     };
+}
+
+// === Direct native array access helpers ===
+
+fn findBlobArrayByField(cp: []const types.CpInfo, field_idx: u16, enc_arrays: []const array_encrypt_mod.EncryptedArray, class_name: []const u8) ?usize {
+    if (field_idx >= cp.len) return null;
+    const fref = switch (cp[field_idx]) { .fieldref => |r| r, else => return null };
+    if (fref.name_and_type_index >= cp.len) return null;
+    const nat = switch (cp[fref.name_and_type_index]) { .name_and_type => |n| n, else => return null };
+    const fname = switch (cp[nat.name_index]) { .utf8 => |s| s, else => return null };
+
+    for (enc_arrays, 0..) |arr, idx| {
+        if (std.mem.eql(u8, arr.field_name, fname) and std.mem.eql(u8, arr.class_name, class_name)) return idx;
+    }
+    return null;
+}
+
+fn valuePushLenForTranspile(code: []const u8, pc: u32, code_len: u32) u32 {
+    if (pc >= code_len) return 0;
+    return switch (code[pc]) {
+        0x02...0x08 => 1, // iconst
+        0x10 => 2, // bipush
+        0x11 => 3, // sipush
+        0x15 => 2, // iload
+        0x1a...0x1d => 1, // iload_0..3
+        else => 0,
+    };
+}
+
+fn isArrayLoad(op: u8) bool {
+    return op >= 0x2e and op <= 0x35; // iaload..saload
+}
+
+fn arrayLoadCast(op: u8, elem_type: array_encrypt_mod.ArrayType) []const u8 {
+    _ = op;
+    return switch (elem_type) {
+        .int => "(jlong)(jint)",
+        .long => "(jlong)",
+        .float => "(jlong)*(jint*)&",
+        .double => "(jlong)*(jlong*)&",
+        .byte => "(jlong)(jint)(jbyte)",
+        .short => "(jlong)(jint)(jshort)",
+        .char => "(jlong)(jint)(jchar)",
+        .string => "(jlong)(intptr_t)",
+    };
+}
+
+fn emitIndexExpr(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32) !void {
+    switch (code[pc]) {
+        0x02...0x08 => try buf.print(allocator, "{d}", .{@as(i32, @intCast(code[pc])) - 3}),
+        0x10 => try buf.print(allocator, "{d}", .{@as(i32, @as(i8, @bitCast(code[pc + 1])))}),
+        0x11 => try buf.print(allocator, "{d}", .{@as(i32, @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]))))}),
+        0x15 => try buf.print(allocator, "(jint)L{d}", .{code[pc + 1]}),
+        0x1a => try buf.appendSlice(allocator, "(jint)L0"),
+        0x1b => try buf.appendSlice(allocator, "(jint)L1"),
+        0x1c => try buf.appendSlice(allocator, "(jint)L2"),
+        0x1d => try buf.appendSlice(allocator, "(jint)L3"),
+        else => try buf.appendSlice(allocator, "0"),
+    }
 }

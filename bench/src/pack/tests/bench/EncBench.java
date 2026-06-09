@@ -42,7 +42,6 @@ public class EncBench {
     }
 
     public static void main(String[] args) {
-        System.loadLibrary("yurijvm_native");
         run();
     }
 }

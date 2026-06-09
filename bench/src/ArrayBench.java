@@ -1,10 +1,12 @@
 import master.koitoyuu.jnic.Native;
 import master.koitoyuu.jnic.NumberEncrypt;
 import master.koitoyuu.jnic.StringEncrypt;
+import master.koitoyuu.jnic.ArrayObfuscation;
 
 @Native
 @NumberEncrypt
 @StringEncrypt
+@ArrayObfuscation
 public class ArrayBench {
     // 16-element int array (blob encrypted, 1 JNI call)
     private static final int[] SBOX = {

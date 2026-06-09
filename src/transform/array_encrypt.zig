@@ -27,128 +27,175 @@ pub const ArrayEncryptResult = struct {
     modified: bool,
 };
 
-/// Scan <clinit> for array initialization patterns and extract them
-pub fn encryptArrays(allocator: std.mem.Allocator, cf: *types.ClassFile) !ArrayEncryptResult {
+const ARRAY_OBFUSCATION_DESC = "Lmaster/koitoyuu/jnic/ArrayObfuscation;";
+
+/// Scan methods for array initialization patterns and extract them
+pub fn encryptArrays(allocator: std.mem.Allocator, cf: *types.ClassFile, enchanted: bool) !ArrayEncryptResult {
     const class_name = cf.getThisClassName() orelse return .{ .arrays = &.{}, .modified = false };
 
-    // Find <clinit>
-    var clinit_idx: ?usize = null;
-    for (cf.methods, 0..) |method, idx| {
-        const name = cf.getUtf8(method.name_index) orelse continue;
-        if (std.mem.eql(u8, name, "<clinit>")) { clinit_idx = idx; break; }
-    }
-    if (clinit_idx == null) return .{ .arrays = &.{}, .modified = false };
+    // Check for @ArrayObfuscation annotation
+    const class_annotated = hasAnnotation(cf, cf.attributes, ARRAY_OBFUSCATION_DESC);
 
-    // Find Code attribute of <clinit>
-    var code_attr_idx: ?usize = null;
-    var code_data: ?[]const u8 = null;
-    for (cf.methods[clinit_idx.?].attributes, 0..) |attr, ai| {
-        const aname = cf.getUtf8(attr.name_index) orelse continue;
-        if (std.mem.eql(u8, aname, "Code")) { code_data = attr.data; code_attr_idx = ai; break; }
+    // Collect annotated field names (field-level annotation)
+    var annotated_fields: [64][]const u8 = undefined;
+    var num_annotated_fields: usize = 0;
+    for (cf.fields) |field| {
+        if (class_annotated or hasAnnotation(cf, field.attributes, ARRAY_OBFUSCATION_DESC)) {
+            const fname = cf.getUtf8(field.name_index) orelse continue;
+            if (num_annotated_fields < 64) {
+                annotated_fields[num_annotated_fields] = fname;
+                num_annotated_fields += 1;
+            }
+        }
     }
-    if (code_data == null or code_data.?.len < 8) return .{ .arrays = &.{}, .modified = false };
 
-    const cd = code_data.?;
-    const code_len = readU32(cd, 4);
-    if (8 + code_len > cd.len) return .{ .arrays = &.{}, .modified = false };
-    const code = cd[8 .. 8 + code_len];
+    if (!class_annotated and num_annotated_fields == 0) {
+        // Check method-level annotations
+        var any_method = false;
+        for (cf.methods) |method| {
+            if (hasAnnotation(cf, method.attributes, ARRAY_OBFUSCATION_DESC)) { any_method = true; break; }
+        }
+        if (!any_method) return .{ .arrays = &.{}, .modified = false };
+    }
 
     var arrays: std.ArrayList(EncryptedArray) = .empty;
     defer arrays.deinit(allocator);
 
-    // Key seed for array encryption
     var key_seed: u64 = 0xA7B3C1D9E5F20468;
     key_seed ^= @as(u64, @intCast(class_name.len)) *% 0x6C62272E07BB0142;
-
-    // Mutable copy of code for NOP padding
-    var new_code = try allocator.alloc(u8, cd.len);
-    @memcpy(new_code, cd);
-    var mc = new_code[8 .. 8 + code_len]; // mutable code section
     var modified = false;
 
-    // Add CP entries for array native methods
-    const cp_code_name = try findOrAddUtf8(allocator, cf, "Code");
-    _ = cp_code_name;
+    // Process <clinit> for static field array inits
+    for (cf.methods, 0..) |*method, midx| {
+        const mname = cf.getUtf8(method.name_index) orelse continue;
+        const should_process = class_annotated or
+            std.mem.eql(u8, mname, "<clinit>") or // clinit has field inits
+            hasAnnotation(cf, method.attributes, ARRAY_OBFUSCATION_DESC);
+        if (!should_process) continue;
 
-    var pc: u32 = 0;
-    while (pc < code_len) {
-        // Try to match: pushConst N → newarray/anewarray → (dup+pushI+pushV+xastore)*N → putstatic
-        const match = tryMatchArrayInit(code, pc, code_len, cf);
-        if (match) |m| {
-            if (m.count >= 8) { // Only blob-encrypt arrays with >= 8 elements
-                const key = nextKey(&key_seed);
-                // Extract element data as raw bytes
-                const blob = try extractArrayBlob(allocator, code, m, cf);
-                if (blob) |b| {
-                    // Resolve field info for the putstatic
+        // Find Code attribute
+        var code_attr_idx: ?usize = null;
+        var code_data: ?[]const u8 = null;
+        for (method.attributes, 0..) |attr, ai| {
+            const aname = cf.getUtf8(attr.name_index) orelse continue;
+            if (std.mem.eql(u8, aname, "Code")) { code_data = attr.data; code_attr_idx = ai; break; }
+        }
+        if (code_data == null or code_data.?.len < 8) continue;
+
+        const cd = code_data.?;
+        const code_len = readU32(cd, 4);
+        if (8 + code_len > cd.len) continue;
+        const code = cd[8 .. 8 + code_len];
+
+        // Mutable copy
+        var new_code = try allocator.alloc(u8, cd.len);
+        @memcpy(new_code, cd);
+        var mc = new_code[8 .. 8 + code_len];
+        var method_modified = false;
+
+        var pc: u32 = 0;
+        while (pc < code_len) {
+            const match = tryMatchArrayInit(code, pc, code_len, cf);
+            if (match) |m| {
+                if (m.count >= 8) {
+                    // Check if field is annotated (for field-level filtering)
                     const field_idx = readU16(code, m.putstatic_pc + 1);
-                    const field_info = resolveFieldInfo(cf, field_idx);
-                    if (field_info) |fi| {
-                        try arrays.append(allocator, .{
-                            .key = key,
-                            .data = b,
-                            .elem_type = m.elem_type,
-                            .length = m.count,
-                            .class_name = class_name,
-                            .field_name = fi.name,
-                            .field_descriptor = fi.descriptor,
-                        });
+                    const fi = resolveFieldInfo(cf, field_idx);
+                    const field_allowed = class_annotated or (if (fi) |f| blk: {
+                        for (annotated_fields[0..num_annotated_fields]) |af| {
+                            if (std.mem.eql(u8, af, f.name)) break :blk true;
+                        }
+                        break :blk hasAnnotation(cf, method.attributes, ARRAY_OBFUSCATION_DESC);
+                    } else false);
 
-                        // Add CP entries for the native array method
-                        const arr_method_name = try std.fmt.allocPrint(allocator, "jnic$arr${d}", .{arrays.items.len - 1});
-                        const arr_desc = arrayMethodDesc(m.elem_type);
-                        const cp_arr_name = try findOrAddUtf8(allocator, cf, arr_method_name);
-                        const cp_arr_desc = try findOrAddUtf8(allocator, cf, arr_desc);
-                        const cp_arr_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_arr_name, .descriptor_index = cp_arr_desc } });
-                        const cp_arr_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_arr_nat } });
+                    if (field_allowed) {
+                        const key = nextKey(&key_seed);
+                        const blob = try extractArrayBlob(allocator, code, m, cf);
+                        if (blob) |b| {
+                            if (fi) |field_info| {
+                                try arrays.append(allocator, .{
+                                    .key = key,
+                                    .data = b,
+                                    .elem_type = m.elem_type,
+                                    .length = m.count,
+                                    .class_name = class_name,
+                                    .field_name = field_info.name,
+                                    .field_descriptor = field_info.descriptor,
+                                });
 
-                        // Add key as Long in CP
-                        const cp_key = try addCpEntry(allocator, cf, types.CpInfo{ .long = key });
-                        _ = try addCpEntry(allocator, cf, .long_continuation);
+                                // Generate method name and descriptor based on enchanted mode
+                                const arr_method_name = try std.fmt.allocPrint(allocator, "jnic$arr${d}", .{arrays.items.len - 1});
+                                const arr_desc = if (enchanted) arrayMethodDescEnchanted(m.elem_type) else arrayMethodDesc(m.elem_type);
+                                const cp_arr_name = try findOrAddUtf8(allocator, cf, arr_method_name);
+                                const cp_arr_desc = try findOrAddUtf8(allocator, cf, arr_desc);
+                                const cp_arr_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_arr_name, .descriptor_index = cp_arr_desc } });
+                                const cp_arr_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cf.this_class, .name_and_type_index = cp_arr_nat } });
 
-                        // Replace bytecode: ldc2_w key(3) + invokestatic arr_ref(3) + putstatic field(3) = 9 bytes
-                        // NOP-pad the rest
-                        mc[m.start_pc] = 0x14; // ldc2_w
-                        mc[m.start_pc + 1] = @intCast(cp_key >> 8);
-                        mc[m.start_pc + 2] = @intCast(cp_key & 0xff);
-                        mc[m.start_pc + 3] = 0xb8; // invokestatic
-                        mc[m.start_pc + 4] = @intCast(cp_arr_ref >> 8);
-                        mc[m.start_pc + 5] = @intCast(cp_arr_ref & 0xff);
-                        mc[m.start_pc + 6] = 0xb3; // putstatic (reuse original field ref)
-                        mc[m.start_pc + 7] = code[m.putstatic_pc + 1];
-                        mc[m.start_pc + 8] = code[m.putstatic_pc + 2];
-                        // NOP the rest
-                        const end_pc = m.putstatic_pc + 3;
-                        for (m.start_pc + 9..end_pc) |i| mc[i] = 0x00;
+                                const cp_key = try addCpEntry(allocator, cf, types.CpInfo{ .long = key });
+                                _ = try addCpEntry(allocator, cf, .long_continuation);
 
-                        // Add native method to class
-                        const method_attrs = try allocator.alloc(types.AttributeInfo, 0);
-                        var new_methods = try allocator.alloc(types.MethodInfo, cf.methods.len + 1);
-                        @memcpy(new_methods[0..cf.methods.len], cf.methods);
-                        new_methods[cf.methods.len] = .{
-                            .access_flags = types.ACC_PRIVATE | types.ACC_STATIC | types.ACC_NATIVE,
-                            .name_index = cp_arr_name,
-                            .descriptor_index = cp_arr_desc,
-                            .attributes = method_attrs,
-                        };
-                        cf.methods = new_methods;
+                                if (enchanted) {
+                                    // Dual-key: ldc2_w key(3) + getstatic dk(3) + invokestatic(3) + putstatic(3) = 12 bytes
+                                    const dk = nextKey(&key_seed);
+                                    arrays.items[arrays.items.len - 1].key = key; // update with decode info
+                                    _ = dk; // TODO: implement dk field for arrays when enchanted
+                                    // For now, use same single-key path
+                                    mc[m.start_pc] = 0x14;
+                                    mc[m.start_pc + 1] = @intCast(cp_key >> 8);
+                                    mc[m.start_pc + 2] = @intCast(cp_key & 0xff);
+                                    mc[m.start_pc + 3] = 0xb8;
+                                    mc[m.start_pc + 4] = @intCast(cp_arr_ref >> 8);
+                                    mc[m.start_pc + 5] = @intCast(cp_arr_ref & 0xff);
+                                    mc[m.start_pc + 6] = 0xb3;
+                                    mc[m.start_pc + 7] = code[m.putstatic_pc + 1];
+                                    mc[m.start_pc + 8] = code[m.putstatic_pc + 2];
+                                    const end_pc = m.putstatic_pc + 3;
+                                    for (m.start_pc + 9..end_pc) |i| mc[i] = 0x00;
+                                } else {
+                                    // Single-key: ldc2_w key(3) + invokestatic(3) + putstatic(3) = 9 bytes
+                                    mc[m.start_pc] = 0x14;
+                                    mc[m.start_pc + 1] = @intCast(cp_key >> 8);
+                                    mc[m.start_pc + 2] = @intCast(cp_key & 0xff);
+                                    mc[m.start_pc + 3] = 0xb8;
+                                    mc[m.start_pc + 4] = @intCast(cp_arr_ref >> 8);
+                                    mc[m.start_pc + 5] = @intCast(cp_arr_ref & 0xff);
+                                    mc[m.start_pc + 6] = 0xb3;
+                                    mc[m.start_pc + 7] = code[m.putstatic_pc + 1];
+                                    mc[m.start_pc + 8] = code[m.putstatic_pc + 2];
+                                    const end_pc = m.putstatic_pc + 3;
+                                    for (m.start_pc + 9..end_pc) |i| mc[i] = 0x00;
+                                }
 
-                        modified = true;
-                        pc = end_pc;
-                        continue;
+                                // Add native method
+                                const method_attrs = try allocator.alloc(types.AttributeInfo, 0);
+                                var new_methods = try allocator.alloc(types.MethodInfo, cf.methods.len + 1);
+                                @memcpy(new_methods[0..cf.methods.len], cf.methods);
+                                new_methods[cf.methods.len] = .{
+                                    .access_flags = types.ACC_PRIVATE | types.ACC_STATIC | types.ACC_NATIVE,
+                                    .name_index = cp_arr_name,
+                                    .descriptor_index = cp_arr_desc,
+                                    .attributes = method_attrs,
+                                };
+                                cf.methods = new_methods;
+
+                                method_modified = true;
+                                pc = m.putstatic_pc + 3;
+                                continue;
+                            }
+                        }
                     }
                 }
             }
+            pc += opcodeLen(code, pc, code_len);
         }
-        pc += opcodeLen(code, pc, code_len);
-    }
 
-    if (modified) {
-        // Update the <clinit> code attribute
-        cf.methods[clinit_idx.?].attributes[code_attr_idx.?] = .{
-            .name_index = cf.methods[clinit_idx.?].attributes[code_attr_idx.?].name_index,
-            .data = new_code,
-        };
+        if (method_modified) {
+            cf.methods[midx].attributes[code_attr_idx.?] = .{
+                .name_index = cf.methods[midx].attributes[code_attr_idx.?].name_index,
+                .data = new_code,
+            };
+            modified = true;
+        }
     }
 
     return .{
@@ -424,6 +471,62 @@ pub fn arrayMethodDesc(elem_type: ArrayType) []const u8 {
         .short => "(J)[S",
         .char => "(J)[C",
         .string => "(J)[Ljava/lang/String;",
+    };
+}
+
+pub fn arrayMethodDescEnchanted(elem_type: ArrayType) []const u8 {
+    return switch (elem_type) {
+        .int => "(JJ)[I",
+        .long => "(JJ)[J",
+        .float => "(JJ)[F",
+        .double => "(JJ)[D",
+        .byte => "(JJ)[B",
+        .short => "(JJ)[S",
+        .char => "(JJ)[C",
+        .string => "(JJ)[Ljava/lang/String;",
+    };
+}
+
+fn hasAnnotation(cf: *const types.ClassFile, attrs: []const types.AttributeInfo, target: []const u8) bool {
+    for (attrs) |attr| {
+        const name = cf.getUtf8(attr.name_index) orelse continue;
+        if (!std.mem.eql(u8, name, "RuntimeVisibleAnnotations") and !std.mem.eql(u8, name, "RuntimeInvisibleAnnotations")) continue;
+        if (attr.data.len < 2) continue;
+        const num = (@as(u16, attr.data[0]) << 8) | @as(u16, attr.data[1]);
+        var pos: usize = 2;
+        for (0..num) |_| {
+            if (pos + 2 > attr.data.len) break;
+            const type_idx = (@as(u16, attr.data[pos]) << 8) | @as(u16, attr.data[pos + 1]);
+            const desc = cf.getUtf8(type_idx) orelse "";
+            if (std.mem.eql(u8, desc, target)) return true;
+            pos += 2;
+            if (pos + 2 > attr.data.len) break;
+            const npairs = (@as(u16, attr.data[pos]) << 8) | @as(u16, attr.data[pos + 1]);
+            pos += 2;
+            for (0..npairs) |_| {
+                pos += 2;
+                if (pos >= attr.data.len) break;
+                pos += skipElemValue(attr.data, pos);
+            }
+        }
+    }
+    return false;
+}
+
+fn skipElemValue(data: []const u8, start: usize) usize {
+    if (start >= data.len) return 0;
+    return switch (data[start]) {
+        'B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z', 's', 'c' => 3,
+        'e' => 5,
+        '@' => 5,
+        '[' => blk: {
+            if (start + 3 > data.len) break :blk 1;
+            const count = (@as(u16, data[start + 1]) << 8) | @as(u16, data[start + 2]);
+            var sz: usize = 3;
+            for (0..count) |_| sz += skipElemValue(data, start + sz);
+            break :blk sz;
+        },
+        else => 1,
     };
 }
 

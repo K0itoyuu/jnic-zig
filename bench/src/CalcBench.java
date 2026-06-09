@@ -29,7 +29,6 @@ public class CalcBench {
     }
 
     public static void main(String[] args) {
-        System.loadLibrary("yurijvm_native");
         runAll();
     }
 }
