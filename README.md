@@ -83,7 +83,7 @@ java -jar out.jar
 
 ## 性能基准测试
 
-环境：Windows 11, Java 26, Zig 0.16, AMD Ryzen (10 次取平均)
+环境：Windows 11, Java 26, Zig 0.16, i5-11300H (10 次取平均)
 
 ### PureBench（纯计算：int/long/bitwise/nested 循环）
 
@@ -141,6 +141,3 @@ native_jni.c 包含：
 └── JNI_OnLoad      — 批量 RegisterNatives + 密钥初始化
 ```
 
-## 许可
-
-私有项目，请勿分发。
