@@ -141,3 +141,20 @@ native_jni.c 包含：
 └── JNI_OnLoad      — 批量 RegisterNatives + 密钥初始化
 ```
 
+## 编译
+
+需要 [Zig 0.16+](https://ziglang.org/download/)。
+
+```bash
+# Debug 编译
+zig build
+
+# Release 编译（推荐）
+zig build -Doptimize=ReleaseFast
+```
+
+产物位于 `zig-out/bin/jnic-zig.exe`，无运行时依赖，可独立分发。
+
+## 免责声明
+
+本工具仅供学习研究和合法软件保护用途。使用者应确保在授权范围内使用，对使用本工具造成的任何后果自行承担全部责任。作者不对因滥用本工具所产生的任何直接或间接损失负责。

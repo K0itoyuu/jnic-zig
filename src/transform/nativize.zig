@@ -71,8 +71,8 @@ pub fn nativize(allocator: std.mem.Allocator, cf: *types.ClassFile) !NativizeRes
     if (anno.class_annotated) {
         for (cf.methods) |*method| {
             const name = cf.getUtf8(method.name_index) orelse continue;
-            // Skip constructors, clinit, main (main is now a stub), and runStr
-            if (std.mem.eql(u8, name, "<init>") or std.mem.eql(u8, name, "<clinit>") or std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "jnic$main") or std.mem.eql(u8, name, "runStr")) continue;
+            // Skip constructors, clinit, main (main is now a stub)
+            if (std.mem.eql(u8, name, "<init>") or std.mem.eql(u8, name, "<clinit>") or std.mem.eql(u8, name, "main") or std.mem.eql(u8, name, "jnic$main")) continue;
             if (method.access_flags & types.ACC_NATIVE != 0) continue;
             if (method.access_flags & types.ACC_ABSTRACT != 0) continue;
 
