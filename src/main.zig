@@ -4,6 +4,7 @@ const parser = @import("classfile/parser.zig");
 const class_writer = @import("classfile/writer.zig");
 const nativize_mod = @import("transform/nativize.zig");
 const encrypt_mod = @import("transform/encrypt.zig");
+const array_encrypt_mod = @import("transform/array_encrypt.zig");
 const jni = @import("codegen/jni.zig");
 const ffm = @import("codegen/ffm.zig");
 
@@ -40,8 +41,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  Use FFM:     {}\n", .{config.use_ffm});
     std.debug.print("  Anti-debug:  {}\n", .{config.anti_debug});
     std.debug.print("  Renamer:     {}\n", .{config.renamer});
-    std.debug.print("  Remove anno: {}\n", .{config.remove_native_annotation});
+    std.debug.print("  Remove anno: {}\n", .{config.remove_jnic_annotation});
     std.debug.print("  Fast-math:   {}\n", .{config.fast_math});
+    std.debug.print("  Enchant enc: {}\n", .{config.enchanted_encryption});
     std.debug.print("  Input JAR:   {s}\n", .{config.input_jar});
     std.debug.print("  Output JAR:  {s}\n", .{config.output_jar});
 
@@ -71,13 +73,15 @@ pub fn main(init: std.process.Init) !void {
     defer all_enc_strings.deinit(allocator);
     var all_enc_numbers: std.ArrayList(encrypt_mod.EncryptedNumber) = .empty;
     defer all_enc_numbers.deinit(allocator);
+    var all_enc_arrays: std.ArrayList(array_encrypt_mod.EncryptedArray) = .empty;
+    defer all_enc_arrays.deinit(allocator);
 
     var dir = Dir.cwd().openDir(io, tmp_in, .{ .iterate = true }) catch |err| {
         std.debug.print("Error opening temp dir: {}\n", .{err});
         return;
     };
     defer dir.close(io);
-    try processDirectory(allocator, io, dir, tmp_out, &all_extracted, &all_enc_strings, &all_enc_numbers, config.remove_native_annotation);
+    try processDirectory(allocator, io, dir, tmp_out, &all_extracted, &all_enc_strings, &all_enc_numbers, &all_enc_arrays, config.remove_jnic_annotation, config.enchanted_encryption);
 
     // Copy non-class files (META-INF, resources) from input to output
     copyNonClassFiles(allocator, io, tmp_in, tmp_out);
@@ -97,10 +101,31 @@ pub fn main(init: std.process.Init) !void {
             Dir.cwd().writeFile(io, .{ .sub_path = "NativeBindings.java", .data = output.java_source }) catch {};
             std.debug.print("Generated: native_ffm.c, NativeBindings.java\n", .{});
         } else {
-            const c_source = try jni.generateJniSource(allocator, all_extracted.items, config.watermark, config.anti_debug, config.renamer, all_enc_strings.items, all_enc_numbers.items);
+            const c_source = try jni.generateJniSource(allocator, all_extracted.items, config.watermark, config.anti_debug, config.renamer, all_enc_strings.items, all_enc_numbers.items, all_enc_arrays.items, config.enchanted_encryption);
             Dir.cwd().writeFile(io, .{ .sub_path = "native_jni.c", .data = c_source }) catch {};
             std.debug.print("Generated: native_jni.c\n", .{});
         }
+    }
+
+    // Embed NativeLoader.class into output directory
+    if (all_extracted.items.len > 0) {
+        const loader_class_data = @embedFile("resources/NativeLoader.class");
+        const loader_dir = tmp_out ++ "/master/koitoyuu/jnic";
+        Dir.cwd().createDirPath(io, loader_dir) catch {};
+        Dir.cwd().writeFile(io, .{ .sub_path = loader_dir ++ "/NativeLoader.class", .data = loader_class_data }) catch {};
+    }
+
+    // Remove annotation class files from output if configured
+    if (config.remove_jnic_annotation) {
+        const anno_base = tmp_out ++ "/master/koitoyuu/jnic";
+        Dir.cwd().deleteFile(io, anno_base ++ "/Native.class") catch {};
+        Dir.cwd().deleteFile(io, anno_base ++ "/StringEncrypt.class") catch {};
+        Dir.cwd().deleteFile(io, anno_base ++ "/NumberEncrypt.class") catch {};
+        // Also remove old-package annotation files if present
+        const old_base = tmp_out ++ "/master/koitoyuu";
+        Dir.cwd().deleteFile(io, old_base ++ "/Native.class") catch {};
+        Dir.cwd().deleteFile(io, old_base ++ "/StringEncrypt.class") catch {};
+        Dir.cwd().deleteFile(io, old_base ++ "/NumberEncrypt.class") catch {};
     }
 
     // Repack output JAR, preserving original MANIFEST.MF
@@ -113,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Generate launch script
     if (all_extracted.items.len > 0) {
-        const lib_name = if (config.use_ffm) "yurijvm_native_ffm" else "yurijvm_native";
+        const lib_name = if (config.use_ffm) "jnic_native_ffm" else "jnic_native";
         const script = try std.fmt.allocPrint(allocator,
             \\@echo off
             \\java -Xss4m -Djava.library.path=. --enable-native-access=ALL-UNNAMED -jar {s} %*
@@ -198,7 +223,9 @@ fn processDirectory(
     extracted: *std.ArrayList(nativize_mod.ExtractedMethod),
     enc_strings: *std.ArrayList(encrypt_mod.EncryptedString),
     enc_numbers: *std.ArrayList(encrypt_mod.EncryptedNumber),
+    enc_arrays: *std.ArrayList(array_encrypt_mod.EncryptedArray),
     remove_annotation: bool,
+    enchanted: bool,
 ) !void {
     var walker = try Dir.walk(dir, allocator);
     defer walker.deinit();
@@ -207,7 +234,7 @@ fn processDirectory(
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".class")) continue;
 
-        try processClassEntry(allocator, io, entry, output_base, extracted, enc_strings, enc_numbers, remove_annotation);
+        try processClassEntry(allocator, io, entry, output_base, extracted, enc_strings, enc_numbers, enc_arrays, remove_annotation, enchanted);
     }
 }
 
@@ -219,7 +246,9 @@ fn processClassEntry(
     extracted: *std.ArrayList(nativize_mod.ExtractedMethod),
     enc_strings: *std.ArrayList(encrypt_mod.EncryptedString),
     enc_numbers: *std.ArrayList(encrypt_mod.EncryptedNumber),
+    enc_arrays: *std.ArrayList(array_encrypt_mod.EncryptedArray),
     remove_annotation: bool,
+    enchanted: bool,
 ) !void {
     const rel_path = entry.path;
 
@@ -234,9 +263,13 @@ fn processClassEntry(
     };
 
     // Apply string/number encryption (before nativize, so encrypted methods get native-ized too)
-    const enc_result = try encrypt_mod.encryptConstants(allocator, &cf);
+    const enc_result = try encrypt_mod.encryptConstants(allocator, &cf, enchanted);
     for (enc_result.strings) |s| try enc_strings.append(allocator, s);
     for (enc_result.numbers) |n| try enc_numbers.append(allocator, n);
+
+    // Apply array encryption (large arrays → blob, before nativize)
+    const arr_result = try array_encrypt_mod.encryptArrays(allocator, &cf);
+    for (arr_result.arrays) |a| try enc_arrays.append(allocator, a);
 
     const result = try nativize_mod.nativize(allocator, &cf);
 
@@ -275,9 +308,9 @@ const Reader = @import("util/reader.zig").Reader;
 /// Remove @Native annotation from class-level and method-level attributes
 fn removeNativeAnnotation(allocator: std.mem.Allocator, cf: *types.ClassFile) void {
     const targets = [_][]const u8{
-        "Lmaster/koitoyuu/Native;",
-        "Lmaster/koitoyuu/StringEncrypt;",
-        "Lmaster/koitoyuu/NumberEncrypt;",
+        "Lmaster/koitoyuu/jnic/Native;",
+        "Lmaster/koitoyuu/jnic/StringEncrypt;",
+        "Lmaster/koitoyuu/jnic/NumberEncrypt;",
     };
 
     // Remove from class attributes

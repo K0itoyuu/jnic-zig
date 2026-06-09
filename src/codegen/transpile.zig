@@ -4,7 +4,7 @@ const nativize = @import("../transform/nativize.zig");
 const cp_extract = @import("cp_extract.zig");
 const encrypt_mod = @import("../transform/encrypt.zig");
 
-/// Check if a method can be transpiled (pure computation, no JNI calls needed)
+/// Check if a method can be transpiled to native C with JNI calls
 pub fn canTranspile(method: nativize.ExtractedMethod) bool {
     const code_data = method.code_data;
     if (code_data.len < 8) return false;
@@ -13,29 +13,58 @@ pub fn canTranspile(method: nativize.ExtractedMethod) bool {
     const code = code_data[8..];
     if (code.len < code_len) return false;
 
+    // Reject methods with exception tables (too complex for first pass)
+    const exc_offset = 8 + code_len;
+    if (code_data.len >= exc_offset + 2) {
+        const exc_count = (@as(u16, code_data[exc_offset]) << 8) | @as(u16, code_data[exc_offset + 1]);
+        if (exc_count > 0) return false;
+    }
+
+    var has_jni_ops = false;
+    var has_loop = false;
     var pc: u32 = 0;
     while (pc < code_len) {
         const op = code[pc];
         switch (op) {
-            // Only allow pure computation opcodes
-            0x00...0x11, 0x14...0x4e, // nop, constants, loads, stores
-            0x57...0x84, // stack ops, arithmetic, conversions, iinc
-            0x85...0x98, // more conversions, comparisons
-            0x99...0xa7, // branches, goto
+            // Pure computation opcodes
+            0x00...0x11, 0x14...0x56, // nop, constants, loads, array loads, stores, array stores
+            0x57...0x84, // stack ops (including dup variants), arithmetic, iinc
+            0x85...0x98, // conversions, comparisons
             0xac...0xb1, // returns
             0xc6, 0xc7, // ifnull/ifnonnull
+            0xc8, // goto_w
             => {},
+            // branches — check for backward jumps (loops)
+            0x99...0xa7 => {
+                const off = @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2])));
+                if (off < 0) has_loop = true;
+            },
             // ldc with int/float only (checked separately)
             0x12, 0x13 => {},
-            0xb8 => {
-                const idx = readU16(code, pc + 1);
-                if (!isEncryptedNumberLookup(method.class_cp, idx)) return false;
+            // JNI operations (non-invoke)
+            0xb2...0xb5, // field access
+            0xbb...0xc1, // new, newarray, anewarray, arraylength, athrow, checkcast, instanceof
+            0xc2, 0xc3, // monitorenter, monitorexit
+            => { has_jni_ops = true; },
+            // Method invocation — check for un-inlinable jnic$native_string
+            0xb6...0xb9 => {
+                has_jni_ops = true;
+                if (op == 0xb8) { // invokestatic
+                    const midx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+                    if (isJnicNativeString(method.class_cp, midx)) return false;
+                }
             },
-            else => return false, // anything else needs interpreter
+            // Reject: invokedynamic (0xba), tableswitch (0xaa), lookupswitch (0xab)
+            0xaa, 0xab, 0xba => return false,
+            else => return false,
         }
         pc += opcodeLen(code, pc, code_len);
     }
-    return true;
+    // Pure computation methods: always transpile
+    if (!has_jni_ops) return true;
+    // Methods with JNI ops: only transpile if they have loops
+    // (avoid regression from JNI crossing overhead on small non-loop helpers)
+    return has_loop;
 }
 
 /// Transpile a method to C code
@@ -100,11 +129,25 @@ pub fn transpileMethod(
     // Declare stack variables
     try buf.appendSlice(allocator, "    /* stack */\n");
     try buf.appendSlice(allocator, "    jlong S[16]; int sp = 0;\n");
-    try buf.appendSlice(allocator, "    (void)env; (void)_cls; (void)S; (void)sp;\n\n");
+    try buf.appendSlice(allocator, "    (void)S; (void)sp;\n");
+    // Exception-check return macro (type-appropriate default)
+    const exc_ret: []const u8 = switch (ret_char) {
+        'V' => "#define _CHK() if((*env)->ExceptionCheck(env)) return\n",
+        'J' => "#define _CHK() if((*env)->ExceptionCheck(env)) return 0LL\n",
+        'F' => "#define _CHK() if((*env)->ExceptionCheck(env)) return 0.0f\n",
+        'D' => "#define _CHK() if((*env)->ExceptionCheck(env)) return 0.0\n",
+        'L', '[' => "#define _CHK() if((*env)->ExceptionCheck(env)) return NULL\n",
+        else => "#define _CHK() if((*env)->ExceptionCheck(env)) return 0\n",
+    };
+    try buf.appendSlice(allocator, exc_ret);
+    try buf.appendSlice(allocator, "\n");
 
     // Generate labels for branch targets first
     var branch_targets: [4096]bool = .{false} ** 4096;
     findBranchTargets(code, code_len, &branch_targets);
+
+    // Counter for unique static variable names in JNI calls
+    var method_idx: u32 = 0;
 
     // Translate bytecode to C
     var pc: u32 = 0;
@@ -114,11 +157,11 @@ pub fn transpileMethod(
             try buf.print(allocator, "  L_{d}:\n", .{pc});
         }
 
-        try translateOpcode(allocator, buf, code, pc, code_len, class_cp, method, enc_numbers);
+        try translateOpcode(allocator, buf, code, pc, code_len, class_cp, method, enc_numbers, &method_idx);
         pc += opcodeLen(code, pc, code_len);
     }
 
-    try buf.appendSlice(allocator, "}\n\n");
+    try buf.appendSlice(allocator, "#undef _CHK\n}\n\n");
 }
 
 fn translateOpcode(
@@ -130,6 +173,7 @@ fn translateOpcode(
     class_cp: []const types.CpInfo,
     method: nativize.ExtractedMethod,
     enc_numbers: []const encrypt_mod.EncryptedNumber,
+    method_idx: *u32,
 ) !void {
     _ = code_len;
     _ = method;
@@ -162,6 +206,15 @@ fn translateOpcode(
         0x22...0x25 => try buf.print(allocator, "    S[sp++] = L{d};\n", .{@as(u32, op) - 0x22}), // fload_N
         0x26...0x29 => try buf.print(allocator, "    S[sp] = L{d}; sp+=2;\n", .{@as(u32, op) - 0x26}), // dload_N
         0x2a...0x2d => try buf.print(allocator, "    S[sp++] = L{d};\n", .{@as(u32, op) - 0x2a}), // aload_N
+        // Array loads
+        0x2e => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jintArray _a=(jintArray)(intptr_t)S[--sp]; jint _v; (*env)->GetIntArrayRegion(env,_a,_i,1,&_v); S[sp++]=(jlong)_v;} /* iaload */\n"),
+        0x2f => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jlongArray _a=(jlongArray)(intptr_t)S[--sp]; jlong _v; (*env)->GetLongArrayRegion(env,_a,_i,1,&_v); S[sp]=_v; sp+=2;} /* laload */\n"),
+        0x30 => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jfloatArray _a=(jfloatArray)(intptr_t)S[--sp]; jfloat _v; (*env)->GetFloatArrayRegion(env,_a,_i,1,&_v); *(jfloat*)&S[sp]=_v; sp++;} /* faload */\n"),
+        0x31 => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jdoubleArray _a=(jdoubleArray)(intptr_t)S[--sp]; jdouble _v; (*env)->GetDoubleArrayRegion(env,_a,_i,1,&_v); *(jdouble*)&S[sp]=_v; sp+=2;} /* daload */\n"),
+        0x32 => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jobjectArray _a=(jobjectArray)(intptr_t)S[--sp]; S[sp++]=(jlong)(intptr_t)(*env)->GetObjectArrayElement(env,_a,_i);} /* aaload */\n"),
+        0x33 => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jbyteArray _a=(jbyteArray)(intptr_t)S[--sp]; jbyte _v; (*env)->GetByteArrayRegion(env,_a,_i,1,&_v); S[sp++]=(jlong)(jint)_v;} /* baload */\n"),
+        0x34 => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jcharArray _a=(jcharArray)(intptr_t)S[--sp]; jchar _v; (*env)->GetCharArrayRegion(env,_a,_i,1,&_v); S[sp++]=(jlong)(jint)_v;} /* caload */\n"),
+        0x35 => try buf.appendSlice(allocator, "    {jint _i=(jint)S[--sp]; jshortArray _a=(jshortArray)(intptr_t)S[--sp]; jshort _v; (*env)->GetShortArrayRegion(env,_a,_i,1,&_v); S[sp++]=(jlong)(jint)_v;} /* saload */\n"),
         // Stores
         0x36 => try buf.print(allocator, "    L{d} = S[--sp]; /* istore */\n", .{code[pc + 1]}),
         0x37 => try buf.print(allocator, "    sp-=2; L{d} = S[sp]; /* lstore */\n", .{code[pc + 1]}),
@@ -173,10 +226,24 @@ fn translateOpcode(
         0x43...0x46 => try buf.print(allocator, "    L{d} = S[--sp];\n", .{@as(u32, op) - 0x43}), // fstore_N
         0x47...0x4a => try buf.print(allocator, "    sp-=2; L{d} = S[sp];\n", .{@as(u32, op) - 0x47}), // dstore_N
         0x4b...0x4e => try buf.print(allocator, "    L{d} = S[--sp];\n", .{@as(u32, op) - 0x4b}), // astore_N
+        // Array stores
+        0x4f => try buf.appendSlice(allocator, "    {jint _v=(jint)S[--sp]; jint _i=(jint)S[--sp]; jintArray _a=(jintArray)(intptr_t)S[--sp]; (*env)->SetIntArrayRegion(env,_a,_i,1,&_v);} /* iastore */\n"),
+        0x50 => try buf.appendSlice(allocator, "    {sp-=2; jlong _v=S[sp]; jint _i=(jint)S[--sp]; jlongArray _a=(jlongArray)(intptr_t)S[--sp]; (*env)->SetLongArrayRegion(env,_a,_i,1,&_v);} /* lastore */\n"),
+        0x51 => try buf.appendSlice(allocator, "    {jfloat _v=*(jfloat*)&S[--sp]; jint _i=(jint)S[--sp]; jfloatArray _a=(jfloatArray)(intptr_t)S[--sp]; (*env)->SetFloatArrayRegion(env,_a,_i,1,&_v);} /* fastore */\n"),
+        0x52 => try buf.appendSlice(allocator, "    {sp-=2; jdouble _v=*(jdouble*)&S[sp]; jint _i=(jint)S[--sp]; jdoubleArray _a=(jdoubleArray)(intptr_t)S[--sp]; (*env)->SetDoubleArrayRegion(env,_a,_i,1,&_v);} /* dastore */\n"),
+        0x53 => try buf.appendSlice(allocator, "    {jobject _v=(jobject)(intptr_t)S[--sp]; jint _i=(jint)S[--sp]; jobjectArray _a=(jobjectArray)(intptr_t)S[--sp]; (*env)->SetObjectArrayElement(env,_a,_i,_v);} /* aastore */\n"),
+        0x54 => try buf.appendSlice(allocator, "    {jbyte _v=(jbyte)(jint)S[--sp]; jint _i=(jint)S[--sp]; jbyteArray _a=(jbyteArray)(intptr_t)S[--sp]; (*env)->SetByteArrayRegion(env,_a,_i,1,&_v);} /* bastore */\n"),
+        0x55 => try buf.appendSlice(allocator, "    {jchar _v=(jchar)(jint)S[--sp]; jint _i=(jint)S[--sp]; jcharArray _a=(jcharArray)(intptr_t)S[--sp]; (*env)->SetCharArrayRegion(env,_a,_i,1,&_v);} /* castore */\n"),
+        0x56 => try buf.appendSlice(allocator, "    {jshort _v=(jshort)(jint)S[--sp]; jint _i=(jint)S[--sp]; jshortArray _a=(jshortArray)(intptr_t)S[--sp]; (*env)->SetShortArrayRegion(env,_a,_i,1,&_v);} /* sastore */\n"),
         // Stack ops
         0x57 => try buf.appendSlice(allocator, "    sp--;\n"),
         0x58 => try buf.appendSlice(allocator, "    sp-=2;\n"),
         0x59 => try buf.appendSlice(allocator, "    S[sp]=S[sp-1];sp++;\n"),
+        0x5a => try buf.appendSlice(allocator, "    {jlong _t=S[sp-1];S[sp-1]=S[sp-2];S[sp-2]=_t;S[sp]=_t;sp++;} /* dup_x1 */\n"),
+        0x5b => try buf.appendSlice(allocator, "    {jlong _t=S[sp-1];S[sp-1]=S[sp-2];S[sp-2]=S[sp-3];S[sp-3]=_t;S[sp]=_t;sp++;} /* dup_x2 */\n"),
+        0x5c => try buf.appendSlice(allocator, "    {S[sp]=S[sp-2];S[sp+1]=S[sp-1];sp+=2;} /* dup2 */\n"),
+        0x5d => try buf.appendSlice(allocator, "    {jlong _a=S[sp-1],_b=S[sp-2];S[sp-1]=S[sp-3];S[sp-2]=_a;S[sp-3]=_b;S[sp]=_b;S[sp+1]=_a;sp+=2;} /* dup2_x1 */\n"),
+        0x5e => try buf.appendSlice(allocator, "    {jlong _a=S[sp-1],_b=S[sp-2];S[sp+1]=_a;S[sp]=_b;S[sp-1]=S[sp-3];S[sp-2]=S[sp-4];S[sp-3]=_a;S[sp-4]=_b;sp+=2;} /* dup2_x2 */\n"),
         0x5f => try buf.appendSlice(allocator, "    {jlong _t=S[sp-1];S[sp-1]=S[sp-2];S[sp-2]=_t;}\n"),
         // Int arithmetic
         0x60 => try buf.appendSlice(allocator, "    {jint _b=(jint)S[--sp],_a=(jint)S[--sp]; S[sp++]=(jlong)(jint)(_a+_b);}\n"),
@@ -264,17 +331,50 @@ fn translateOpcode(
         0xaf => try buf.appendSlice(allocator, "    sp-=2; return *(jdouble*)&S[sp];\n"),
         0xb0 => try buf.appendSlice(allocator, "    return (jobject)S[--sp];\n"),
         0xb1 => try buf.appendSlice(allocator, "    return;\n"),
-        // Field/method access — fall through to JNI calls
+        // Field/method access — emit proper JNI calls
+        0xb2...0xb5 => try emitFieldAccess(allocator, buf, code, pc, class_cp, method_idx),
+        0xb6, 0xb7, 0xb9 => try emitMethodCall(allocator, buf, code, pc, class_cp, method_idx),
         0xb8 => {
             const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
             if (!try emitEncryptedNumberLookup(allocator, buf, class_cp, idx, enc_numbers)) {
-                try emitJniCall(allocator, buf, code, pc);
+                try emitMethodCall(allocator, buf, code, pc, class_cp, method_idx);
             }
         },
-        0xb2...0xb7, 0xb9 => try emitJniCall(allocator, buf, code, pc),
+        // Object operations
+        0xbb => try emitNew(allocator, buf, code, pc, class_cp, method_idx), // new
+        0xbc => try emitNewArray(allocator, buf, code, pc), // newarray
+        0xbd => try emitANewArray(allocator, buf, code, pc, class_cp, method_idx), // anewarray
+        0xbe => try buf.appendSlice(allocator, "    {jarray _a=(jarray)(intptr_t)S[sp-1]; S[sp-1]=(jlong)(*env)->GetArrayLength(env,_a);} /* arraylength */\n"),
+        0xbf => try buf.appendSlice(allocator, "    (*env)->Throw(env,(jthrowable)(intptr_t)S[--sp]); return 0; /* athrow */\n"),
+        0xc0 => { // checkcast
+            const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+            const cn = resolveClassName(class_cp, idx);
+            const n = method_idx.*;
+            method_idx.* += 1;
+            try buf.print(allocator, "    {{ static jclass _c_{d}=NULL;", .{n});
+            try buf.print(allocator, " if(!_c_{d}) _c_{d}=(*env)->FindClass(env,\"{s}\");", .{ n, n, cn });
+            try buf.print(allocator, " if(!(*env)->IsInstanceOf(env,(jobject)(intptr_t)S[sp-1],_c_{d})){{(*env)->ThrowNew(env,(*env)->FindClass(env,\"java/lang/ClassCastException\"),\"\");return 0;}} }}\n", .{n});
+        },
+        0xc1 => { // instanceof
+            const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+            const cn = resolveClassName(class_cp, idx);
+            const n = method_idx.*;
+            method_idx.* += 1;
+            try buf.print(allocator, "    {{ static jclass _c_{d}=NULL;", .{n});
+            try buf.print(allocator, " if(!_c_{d}) _c_{d}=(*env)->FindClass(env,\"{s}\");", .{ n, n, cn });
+            try buf.print(allocator, " jobject _o=(jobject)(intptr_t)S[--sp]; S[sp++]=(jlong)(_o?(*env)->IsInstanceOf(env,_o,_c_{d}):0); }}\n", .{n});
+        },
+        // Monitor operations
+        0xc2 => try buf.appendSlice(allocator, "    (*env)->MonitorEnter(env,(jobject)(intptr_t)S[--sp]); /* monitorenter */\n"),
+        0xc3 => try buf.appendSlice(allocator, "    (*env)->MonitorExit(env,(jobject)(intptr_t)S[--sp]); /* monitorexit */\n"),
         // ifnull/ifnonnull
         0xc6 => try buf.print(allocator, "    if(S[--sp]==0) goto L_{d};\n", .{@as(i32, @intCast(pc)) + @as(i32, @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]))))}),
         0xc7 => try buf.print(allocator, "    if(S[--sp]!=0) goto L_{d};\n", .{@as(i32, @intCast(pc)) + @as(i32, @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]))))}),
+        // goto_w
+        0xc8 => {
+            const off = @as(i32, @bitCast((@as(u32, code[pc + 1]) << 24) | (@as(u32, code[pc + 2]) << 16) | (@as(u32, code[pc + 3]) << 8) | @as(u32, code[pc + 4])));
+            try buf.print(allocator, "    goto L_{d};\n", .{@as(i32, @intCast(pc)) + off});
+        },
         else => try buf.print(allocator, "    /* TODO: opcode 0x{x:0>2} */\n", .{op}),
     }
 }
@@ -284,7 +384,42 @@ fn emitLdc(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), cp: []const ty
     switch (cp[idx]) {
         .integer => |v| try buf.print(allocator, "    S[sp++] = (jlong)(jint){d};\n", .{v}),
         .float => |v| try buf.print(allocator, "    *(jfloat*)&S[sp] = {d}f; sp++;\n", .{v}),
-        .string => try buf.appendSlice(allocator, "    /* ldc string - needs JNI */ S[sp++] = 0;\n"),
+        .string => |str_idx| {
+            const str_val = if (str_idx < cp.len) switch (cp[str_idx]) {
+                .utf8 => |s| s,
+                else => null,
+            } else null;
+            if (str_val) |sv| {
+                try buf.appendSlice(allocator, "    { static jobject _s_c = NULL;\n");
+                try buf.appendSlice(allocator, "      if(!_s_c) _s_c=(*env)->NewGlobalRef(env,(*env)->NewStringUTF(env,\"");
+                // Escape the string for C
+                for (sv) |ch| {
+                    switch (ch) {
+                        '"' => try buf.appendSlice(allocator, "\\\""),
+                        '\\' => try buf.appendSlice(allocator, "\\\\"),
+                        '\n' => try buf.appendSlice(allocator, "\\n"),
+                        '\r' => try buf.appendSlice(allocator, "\\r"),
+                        '\t' => try buf.appendSlice(allocator, "\\t"),
+                        0 => try buf.appendSlice(allocator, "\\0"),
+                        else => {
+                            if (ch >= 0x20 and ch < 0x7f) {
+                                try buf.append(allocator, ch);
+                            } else {
+                                try buf.print(allocator, "\\x{x:0>2}", .{ch});
+                            }
+                        },
+                    }
+                }
+                try buf.appendSlice(allocator, "\"));\n");
+                try buf.appendSlice(allocator, "      S[sp++]=(jlong)(intptr_t)_s_c; }\n");
+            } else {
+                try buf.appendSlice(allocator, "    S[sp++] = 0;\n");
+            }
+        },
+        .class => {
+            // ldc class - push the Class object
+            try buf.appendSlice(allocator, "    S[sp++] = 0; /* ldc class TODO */\n");
+        },
         else => try buf.appendSlice(allocator, "    S[sp++] = 0;\n"),
     }
 }
@@ -339,12 +474,20 @@ fn isEncryptedNumberLookup(cp: []const types.CpInfo, idx: u16) bool {
     return resolveEncryptedLookup(cp, idx) != null;
 }
 
+fn isJnicNativeString(cp: []const types.CpInfo, idx: u16) bool {
+    const ref = resolveMethodRef(cp, idx) orelse return false;
+    return std.mem.eql(u8, ref.name, "jnic$native_string");
+}
+
 fn resolveEncryptedLookup(cp: []const types.CpInfo, idx: u16) ?EncryptedLookup {
     const ref = resolveMethodRef(cp, idx) orelse return null;
-    if (std.mem.eql(u8, ref.name, "jnic$native_int") and std.mem.eql(u8, ref.descriptor, "(J)I")) return .{ .kind = .int };
-    if (std.mem.eql(u8, ref.name, "jnic$native_long") and std.mem.eql(u8, ref.descriptor, "(J)J")) return .{ .kind = .long };
-    if (std.mem.eql(u8, ref.name, "jnic$native_float") and std.mem.eql(u8, ref.descriptor, "(J)F")) return .{ .kind = .float };
-    if (std.mem.eql(u8, ref.name, "jnic$native_double") and std.mem.eql(u8, ref.descriptor, "(J)D")) return .{ .kind = .double };
+    // Match both old (J)X and new dual-key (JJ)X descriptors
+    if (std.mem.eql(u8, ref.name, "jnic$native_int") and (std.mem.eql(u8, ref.descriptor, "(J)I") or std.mem.eql(u8, ref.descriptor, "(JJ)I"))) return .{ .kind = .int };
+    if (std.mem.eql(u8, ref.name, "jnic$native_long") and (std.mem.eql(u8, ref.descriptor, "(J)J") or std.mem.eql(u8, ref.descriptor, "(JJ)J"))) return .{ .kind = .long };
+    if (std.mem.eql(u8, ref.name, "jnic$native_float") and (std.mem.eql(u8, ref.descriptor, "(J)F") or std.mem.eql(u8, ref.descriptor, "(JJ)F"))) return .{ .kind = .float };
+    if (std.mem.eql(u8, ref.name, "jnic$native_double") and (std.mem.eql(u8, ref.descriptor, "(J)D") or std.mem.eql(u8, ref.descriptor, "(JJ)D"))) return .{ .kind = .double };
+    // Also check for jnic$native_string
+    if (std.mem.startsWith(u8, ref.name, "jnic$native_")) return null; // known jnic method but can't inline → signal to reject
     return null;
 }
 
@@ -377,19 +520,387 @@ fn getUtf8(cp: []const types.CpInfo, idx: u16) []const u8 {
     };
 }
 
-fn emitJniCall(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32) !void {
-    const op = code[pc];
-    
-    
-    
-    // For field/method access, generate a comment and fallback
-    const name = switch (op) {
-        0xb2 => "getstatic", 0xb3 => "putstatic", 0xb4 => "getfield", 0xb5 => "putfield",
-        0xb6 => "invokevirtual", 0xb7 => "invokespecial", 0xb8 => "invokestatic", 0xb9 => "invokeinterface",
-        else => "unknown",
+// === JNI Code Generation ===
+
+fn resolveClassName(cp: []const types.CpInfo, class_idx: u16) []const u8 {
+    if (class_idx >= cp.len) return "java/lang/Object";
+    return switch (cp[class_idx]) {
+        .class => |name_idx| getUtf8(cp, name_idx),
+        else => "java/lang/Object",
     };
-    try buf.print(allocator, "    /* {s} #{d} - needs interpreter fallback */\n", .{ name, (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]) });
 }
+
+const FieldRefInfo = struct {
+    class_name: []const u8,
+    field_name: []const u8,
+    descriptor: []const u8,
+};
+
+fn resolveFieldRef(cp: []const types.CpInfo, idx: u16) ?FieldRefInfo {
+    if (idx >= cp.len) return null;
+    const ref = switch (cp[idx]) {
+        .fieldref => |r| r,
+        else => return null,
+    };
+    const class_name = resolveClassName(cp, ref.class_index);
+    if (ref.name_and_type_index >= cp.len) return null;
+    const nt = switch (cp[ref.name_and_type_index]) {
+        .name_and_type => |n| n,
+        else => return null,
+    };
+    return .{
+        .class_name = class_name,
+        .field_name = getUtf8(cp, nt.name_index),
+        .descriptor = getUtf8(cp, nt.descriptor_index),
+    };
+}
+
+const FullMethodRefInfo = struct {
+    class_name: []const u8,
+    method_name: []const u8,
+    descriptor: []const u8,
+};
+
+fn resolveFullMethodRef(cp: []const types.CpInfo, idx: u16) ?FullMethodRefInfo {
+    if (idx >= cp.len) return null;
+    const ref = switch (cp[idx]) {
+        .methodref => |r| r,
+        .interface_methodref => |r| r,
+        else => return null,
+    };
+    const class_name = resolveClassName(cp, ref.class_index);
+    if (ref.name_and_type_index >= cp.len) return null;
+    const nt = switch (cp[ref.name_and_type_index]) {
+        .name_and_type => |n| n,
+        else => return null,
+    };
+    return .{
+        .class_name = class_name,
+        .method_name = getUtf8(cp, nt.name_index),
+        .descriptor = getUtf8(cp, nt.descriptor_index),
+    };
+}
+
+/// Count slots consumed by method arguments (J/D = 2 slots each, others = 1)
+fn countArgSlots(desc: []const u8) u16 {
+    var slots: u16 = 0;
+    var i: usize = 0;
+    if (i >= desc.len or desc[i] != '(') return 0;
+    i += 1;
+    while (i < desc.len and desc[i] != ')') {
+        switch (desc[i]) {
+            'J', 'D' => { slots += 2; i += 1; },
+            'L' => { slots += 1; while (i < desc.len and desc[i] != ';') i += 1; i += 1; },
+            '[' => { slots += 1; i += 1; while (i < desc.len and desc[i] == '[') i += 1;
+                if (i < desc.len and desc[i] == 'L') { while (i < desc.len and desc[i] != ';') i += 1; i += 1; } else if (i < desc.len) i += 1; },
+            else => { slots += 1; i += 1; },
+        }
+    }
+    return slots;
+}
+
+/// Get the types of each argument slot for jvalue array construction
+const ArgSlotInfo = struct { types: [128]u8 = undefined, count: u16 = 0 };
+fn getArgSlots(desc: []const u8) ArgSlotInfo {
+    var info = ArgSlotInfo{};
+    var i: usize = 0;
+    if (i >= desc.len or desc[i] != '(') return info;
+    i += 1;
+    while (i < desc.len and desc[i] != ')') {
+        if (info.count >= 128) break;
+        switch (desc[i]) {
+            'B', 'C', 'S', 'I', 'Z' => { info.types[info.count] = 'I'; info.count += 1; i += 1; },
+            'J' => { info.types[info.count] = 'J'; info.count += 1; i += 1; },
+            'F' => { info.types[info.count] = 'F'; info.count += 1; i += 1; },
+            'D' => { info.types[info.count] = 'D'; info.count += 1; i += 1; },
+            'L' => { info.types[info.count] = 'L'; info.count += 1; while (i < desc.len and desc[i] != ';') i += 1; i += 1; },
+            '[' => { info.types[info.count] = 'L'; info.count += 1; i += 1;
+                while (i < desc.len and desc[i] == '[') i += 1;
+                if (i < desc.len and desc[i] == 'L') { while (i < desc.len and desc[i] != ';') i += 1; i += 1; } else if (i < desc.len) i += 1; },
+            else => { i += 1; },
+        }
+    }
+    return info;
+}
+
+fn jniFieldGetter(desc_char: u8, is_static: bool) []const u8 {
+    if (is_static) {
+        return switch (desc_char) {
+            'I', 'Z', 'B', 'S', 'C' => "GetStaticIntField",
+            'J' => "GetStaticLongField",
+            'F' => "GetStaticFloatField",
+            'D' => "GetStaticDoubleField",
+            else => "GetStaticObjectField",
+        };
+    } else {
+        return switch (desc_char) {
+            'I', 'Z', 'B', 'S', 'C' => "GetIntField",
+            'J' => "GetLongField",
+            'F' => "GetFloatField",
+            'D' => "GetDoubleField",
+            else => "GetObjectField",
+        };
+    }
+}
+
+fn jniFieldSetter(desc_char: u8, is_static: bool) []const u8 {
+    if (is_static) {
+        return switch (desc_char) {
+            'I', 'Z', 'B', 'S', 'C' => "SetStaticIntField",
+            'J' => "SetStaticLongField",
+            'F' => "SetStaticFloatField",
+            'D' => "SetStaticDoubleField",
+            else => "SetStaticObjectField",
+        };
+    } else {
+        return switch (desc_char) {
+            'I', 'Z', 'B', 'S', 'C' => "SetIntField",
+            'J' => "SetLongField",
+            'F' => "SetFloatField",
+            'D' => "SetDoubleField",
+            else => "SetObjectField",
+        };
+    }
+}
+
+fn fieldDescChar(desc: []const u8) u8 {
+    if (desc.len == 0) return 'L';
+    return desc[0];
+}
+
+fn emitFieldAccess(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32, cp: []const types.CpInfo, method_idx: *u32) !void {
+    const op = code[pc];
+    const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+    const ref = resolveFieldRef(cp, idx) orelse {
+        try buf.print(allocator, "    /* unresolved field #{d} */\n", .{idx});
+        return;
+    };
+    const n = method_idx.*;
+    method_idx.* += 1;
+    const dc = fieldDescChar(ref.descriptor);
+    const is_static = (op == 0xb2 or op == 0xb3);
+    const id_func: []const u8 = if (is_static) "GetStaticFieldID" else "GetFieldID";
+
+    try buf.print(allocator, "    {{ /* {s} {s}.{s}:{s} */\n", .{
+        switch (op) { 0xb2 => @as([]const u8, "getstatic"), 0xb3 => "putstatic", 0xb4 => "getfield", else => "putfield" },
+        ref.class_name, ref.field_name, ref.descriptor,
+    });
+    try buf.print(allocator, "      static jclass _c_{d}=NULL; static jfieldID _f_{d}=NULL;\n", .{ n, n });
+    try buf.print(allocator, "      if(!_f_{d}){{_c_{d}=(*env)->FindClass(env,\"{s}\");_f_{d}=(*env)->{s}(env,_c_{d},\"{s}\",\"{s}\");}}\n", .{
+        n, n, ref.class_name, n, id_func, n, ref.field_name, ref.descriptor,
+    });
+
+    switch (op) {
+        0xb2 => { // getstatic
+            switch (dc) {
+                'J' => try buf.print(allocator, "      S[sp]=(*env)->{s}(env,_c_{d},_f_{d}); sp+=2;\n", .{ jniFieldGetter(dc, true), n, n }),
+                'D' => try buf.print(allocator, "      *(jdouble*)&S[sp]=(*env)->{s}(env,_c_{d},_f_{d}); sp+=2;\n", .{ jniFieldGetter(dc, true), n, n }),
+                'F' => try buf.print(allocator, "      *(jfloat*)&S[sp]=(*env)->{s}(env,_c_{d},_f_{d}); sp++;\n", .{ jniFieldGetter(dc, true), n, n }),
+                'L', '[' => try buf.print(allocator, "      S[sp++]=(jlong)(intptr_t)(*env)->{s}(env,_c_{d},_f_{d});\n", .{ jniFieldGetter(dc, true), n, n }),
+                else => try buf.print(allocator, "      S[sp++]=(jlong)(jint)(*env)->{s}(env,_c_{d},_f_{d});\n", .{ jniFieldGetter(dc, true), n, n }),
+            }
+        },
+        0xb3 => { // putstatic
+            switch (dc) {
+                'J' => try buf.print(allocator, "      sp-=2; (*env)->{s}(env,_c_{d},_f_{d},(jlong)S[sp]);\n", .{ jniFieldSetter(dc, true), n, n }),
+                'D' => try buf.print(allocator, "      sp-=2; (*env)->{s}(env,_c_{d},_f_{d},*(jdouble*)&S[sp]);\n", .{ jniFieldSetter(dc, true), n, n }),
+                'F' => try buf.print(allocator, "      (*env)->{s}(env,_c_{d},_f_{d},*(jfloat*)&S[--sp]);\n", .{ jniFieldSetter(dc, true), n, n }),
+                'L', '[' => try buf.print(allocator, "      (*env)->{s}(env,_c_{d},_f_{d},(jobject)(intptr_t)S[--sp]);\n", .{ jniFieldSetter(dc, true), n, n }),
+                else => try buf.print(allocator, "      (*env)->{s}(env,_c_{d},_f_{d},(jint)S[--sp]);\n", .{ jniFieldSetter(dc, true), n, n }),
+            }
+        },
+        0xb4 => { // getfield
+            try buf.appendSlice(allocator, "      jobject _obj=(jobject)(intptr_t)S[--sp];\n");
+            switch (dc) {
+                'J' => try buf.print(allocator, "      S[sp]=(*env)->{s}(env,_obj,_f_{d}); sp+=2;\n", .{ jniFieldGetter(dc, false), n }),
+                'D' => try buf.print(allocator, "      *(jdouble*)&S[sp]=(*env)->{s}(env,_obj,_f_{d}); sp+=2;\n", .{ jniFieldGetter(dc, false), n }),
+                'F' => try buf.print(allocator, "      *(jfloat*)&S[sp]=(*env)->{s}(env,_obj,_f_{d}); sp++;\n", .{ jniFieldGetter(dc, false), n }),
+                'L', '[' => try buf.print(allocator, "      S[sp++]=(jlong)(intptr_t)(*env)->{s}(env,_obj,_f_{d});\n", .{ jniFieldGetter(dc, false), n }),
+                else => try buf.print(allocator, "      S[sp++]=(jlong)(jint)(*env)->{s}(env,_obj,_f_{d});\n", .{ jniFieldGetter(dc, false), n }),
+            }
+        },
+        0xb5 => { // putfield
+            switch (dc) {
+                'J' => try buf.print(allocator, "      sp-=2; jlong _val=S[sp]; jobject _obj=(jobject)(intptr_t)S[--sp]; (*env)->{s}(env,_obj,_f_{d},_val);\n", .{ jniFieldSetter(dc, false), n }),
+                'D' => try buf.print(allocator, "      sp-=2; jdouble _val=*(jdouble*)&S[sp]; jobject _obj=(jobject)(intptr_t)S[--sp]; (*env)->{s}(env,_obj,_f_{d},_val);\n", .{ jniFieldSetter(dc, false), n }),
+                'F' => try buf.print(allocator, "      jfloat _val=*(jfloat*)&S[--sp]; jobject _obj=(jobject)(intptr_t)S[--sp]; (*env)->{s}(env,_obj,_f_{d},_val);\n", .{ jniFieldSetter(dc, false), n }),
+                'L', '[' => try buf.print(allocator, "      jobject _val=(jobject)(intptr_t)S[--sp]; jobject _obj=(jobject)(intptr_t)S[--sp]; (*env)->{s}(env,_obj,_f_{d},_val);\n", .{ jniFieldSetter(dc, false), n }),
+                else => try buf.print(allocator, "      jint _val=(jint)S[--sp]; jobject _obj=(jobject)(intptr_t)S[--sp]; (*env)->{s}(env,_obj,_f_{d},_val);\n", .{ jniFieldSetter(dc, false), n }),
+            }
+        },
+        else => {},
+    }
+    try buf.appendSlice(allocator, "    }\n");
+}
+
+fn jniCallSuffix(ret_char: u8) []const u8 {
+    return switch (ret_char) {
+        'V' => "Void",
+        'I', 'Z', 'B', 'S', 'C' => "Int",
+        'J' => "Long",
+        'F' => "Float",
+        'D' => "Double",
+        else => "Object",
+    };
+}
+
+fn emitMethodCall(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32, cp: []const types.CpInfo, method_idx: *u32) !void {
+    const op = code[pc];
+    const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+    const ref = resolveFullMethodRef(cp, idx) orelse {
+        try buf.print(allocator, "    /* unresolved method #{d} */\n", .{idx});
+        return;
+    };
+    const n = method_idx.*;
+    method_idx.* += 1;
+    const is_static = (op == 0xb8);
+    const is_interface = (op == 0xb9);
+    const desc = ref.descriptor;
+    const ret_char = getReturnChar(desc);
+    const arg_slots = countArgSlots(desc);
+    const args_info = getArgSlots(desc);
+    const suffix = jniCallSuffix(ret_char);
+
+    const id_func: []const u8 = if (is_static) "GetStaticMethodID" else "GetMethodID";
+
+    try buf.print(allocator, "    {{ /* {s} {s}.{s}{s} */\n", .{
+        switch (op) { 0xb6 => @as([]const u8, "invokevirtual"), 0xb7 => "invokespecial", 0xb8 => "invokestatic", else => "invokeinterface" },
+        ref.class_name, ref.method_name, ref.descriptor,
+    });
+    try buf.print(allocator, "      static jclass _c_{d}=NULL; static jmethodID _m_{d}=NULL;\n", .{ n, n });
+    try buf.print(allocator, "      if(!_m_{d}){{_c_{d}=(*env)->FindClass(env,\"{s}\");_m_{d}=(*env)->{s}(env,_c_{d},\"{s}\",\"{s}\");}}\n", .{
+        n, n, ref.class_name, n, id_func, n, ref.method_name, ref.descriptor,
+    });
+
+    // Emit jvalue array and pop args from stack (right to left already on stack)
+    if (args_info.count > 0) {
+        try buf.print(allocator, "      jvalue _args_{d}[{d}];\n", .{ n, args_info.count });
+        // Pop arguments in reverse order from the stack
+        var ai: u16 = args_info.count;
+        while (ai > 0) {
+            ai -= 1;
+            const at = args_info.types[ai];
+            switch (at) {
+                'J' => try buf.print(allocator, "      sp-=2; _args_{d}[{d}].j=S[sp];\n", .{ n, ai }),
+                'D' => try buf.print(allocator, "      sp-=2; _args_{d}[{d}].d=*(jdouble*)&S[sp];\n", .{ n, ai }),
+                'F' => try buf.print(allocator, "      _args_{d}[{d}].f=*(jfloat*)&S[--sp];\n", .{ n, ai }),
+                'L' => try buf.print(allocator, "      _args_{d}[{d}].l=(jobject)(intptr_t)S[--sp];\n", .{ n, ai }),
+                else => try buf.print(allocator, "      _args_{d}[{d}].i=(jint)S[--sp];\n", .{ n, ai }),
+            }
+        }
+    } else {
+        // Pop arg_slots even with 0 typed args (shouldn't happen normally but safety)
+        _ = arg_slots;
+    }
+
+    // Pop receiver for non-static
+    if (!is_static) {
+        try buf.print(allocator, "      jobject _recv_{d}=(jobject)(intptr_t)S[--sp];\n", .{n});
+    }
+
+    // Generate the call
+    const has_args = args_info.count > 0;
+
+    if (is_static) {
+        try emitCallLine(allocator, buf, "CallStatic", suffix, null, n, n, has_args, ret_char);
+    } else if (is_interface) {
+        try emitCallLine(allocator, buf, "Call", jniCallSuffix(ret_char), n, n, n, has_args, ret_char);
+    } else if (op == 0xb7) {
+        // invokespecial - use CallNonvirtual
+        try emitNonvirtualCallLine(allocator, buf, suffix, n, has_args, ret_char);
+    } else {
+        // invokevirtual
+        try emitCallLine(allocator, buf, "Call", suffix, n, n, n, has_args, ret_char);
+    }
+    try buf.appendSlice(allocator, "      if((*env)->ExceptionCheck(env)) { _CHK(); }\n");
+    try buf.appendSlice(allocator, "    }\n");
+}
+
+fn emitCallLine(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), prefix: []const u8, suffix: []const u8, recv_n: ?u32, cls_n: u32, meth_n: u32, has_args: bool, ret_char: u8) !void {
+    // Emit the actual JNI call line
+    const ret_prefix: []const u8 = switch (ret_char) {
+        'V' => "      ",
+        'J' => "      S[sp]=",
+        'D' => "      *(jdouble*)&S[sp]=",
+        'F' => "      *(jfloat*)&S[sp]=",
+        'L', '[' => "      S[sp++]=(jlong)(intptr_t)",
+        else => "      S[sp++]=(jlong)(jint)",
+    };
+    try buf.appendSlice(allocator, ret_prefix);
+    try buf.print(allocator, "(*env)->{s}{s}MethodA(env,", .{ prefix, suffix });
+    if (recv_n) |rn| {
+        try buf.print(allocator, "_recv_{d},_m_{d},", .{ rn, meth_n });
+    } else {
+        try buf.print(allocator, "_c_{d},_m_{d},", .{ cls_n, meth_n });
+    }
+    if (has_args) {
+        try buf.print(allocator, "_args_{d});\n", .{meth_n});
+    } else {
+        try buf.appendSlice(allocator, "NULL);\n");
+    }
+    // Emit sp adjustment for wide returns
+    switch (ret_char) {
+        'J', 'D' => try buf.appendSlice(allocator, "      sp+=2;\n"),
+        else => {},
+    }
+}
+
+fn emitNonvirtualCallLine(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), suffix: []const u8, n: u32, has_args: bool, ret_char: u8) !void {
+    const ret_prefix: []const u8 = switch (ret_char) {
+        'V' => "      ",
+        'J' => "      S[sp]=",
+        'D' => "      *(jdouble*)&S[sp]=",
+        'F' => "      *(jfloat*)&S[sp]=",
+        'L', '[' => "      S[sp++]=(jlong)(intptr_t)",
+        else => "      S[sp++]=(jlong)(jint)",
+    };
+    try buf.appendSlice(allocator, ret_prefix);
+    try buf.print(allocator, "(*env)->CallNonvirtual{s}MethodA(env,_recv_{d},_c_{d},_m_{d},", .{ suffix, n, n, n });
+    if (has_args) {
+        try buf.print(allocator, "_args_{d});\n", .{n});
+    } else {
+        try buf.appendSlice(allocator, "NULL);\n");
+    }
+    switch (ret_char) {
+        'J', 'D' => try buf.appendSlice(allocator, "      sp+=2;\n"),
+        else => {},
+    }
+}
+
+fn emitNew(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32, cp: []const types.CpInfo, method_idx: *u32) !void {
+    const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+    const cn = resolveClassName(cp, idx);
+    const n = method_idx.*;
+    method_idx.* += 1;
+    try buf.print(allocator, "    {{ static jclass _c_{d}=NULL; if(!_c_{d}) _c_{d}=(*env)->FindClass(env,\"{s}\");\n", .{ n, n, n, cn });
+    try buf.print(allocator, "      S[sp++]=(jlong)(intptr_t)(*env)->AllocObject(env,_c_{d}); }} /* new */\n", .{n});
+}
+
+fn emitNewArray(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32) !void {
+    const atype = code[pc + 1];
+    const func: []const u8 = switch (atype) {
+        4 => "NewBooleanArray",
+        5 => "NewCharArray",
+        6 => "NewFloatArray",
+        7 => "NewDoubleArray",
+        8 => "NewByteArray",
+        9 => "NewShortArray",
+        10 => "NewIntArray",
+        11 => "NewLongArray",
+        else => "NewIntArray",
+    };
+    try buf.print(allocator, "    {{jint _n=(jint)S[--sp]; S[sp++]=(jlong)(intptr_t)(*env)->{s}(env,_n);}} /* newarray */\n", .{func});
+}
+
+fn emitANewArray(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), code: []const u8, pc: u32, cp: []const types.CpInfo, method_idx: *u32) !void {
+    const idx = (@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]);
+    const cn = resolveClassName(cp, idx);
+    const n = method_idx.*;
+    method_idx.* += 1;
+    try buf.print(allocator, "    {{ static jclass _c_{d}=NULL; if(!_c_{d}) _c_{d}=(*env)->FindClass(env,\"{s}\");\n", .{ n, n, n, cn });
+    try buf.print(allocator, "      jint _n=(jint)S[--sp]; S[sp++]=(jlong)(intptr_t)(*env)->NewObjectArray(env,_n,_c_{d},NULL); }} /* anewarray */\n", .{n});
+}
+
 
 fn findBranchTargets(code: []const u8, code_len: u32, targets: *[4096]bool) void {
     var pc: u32 = 0;
@@ -398,6 +909,10 @@ fn findBranchTargets(code: []const u8, code_len: u32, targets: *[4096]bool) void
         if ((op >= 0x99 and op <= 0xa7) or op == 0xc6 or op == 0xc7) {
             const off: i16 = @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2]));
             const target: i32 = @as(i32, @intCast(pc)) + @as(i32, off);
+            if (target >= 0 and target < 4096) targets[@intCast(target)] = true;
+        } else if (op == 0xc8) { // goto_w
+            const off: i32 = @bitCast((@as(u32, code[pc + 1]) << 24) | (@as(u32, code[pc + 2]) << 16) | (@as(u32, code[pc + 3]) << 8) | @as(u32, code[pc + 4]));
+            const target: i32 = @as(i32, @intCast(pc)) + off;
             if (target >= 0 and target < 4096) targets[@intCast(target)] = true;
         }
         pc += opcodeLen(code, pc, code_len);

@@ -2,7 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const Reader = @import("../util/reader.zig").Reader;
 
-const TARGET_ANNOTATION = "Lmaster/koitoyuu/Native;";
+const TARGET_ANNOTATION = "Lmaster/koitoyuu/jnic/Native;";
 
 pub const AnnotationResult = struct {
     class_annotated: bool,

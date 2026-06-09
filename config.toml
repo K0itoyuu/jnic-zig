@@ -11,11 +11,16 @@ anti_debug = true
 # 开启符号随机化（DLL中的函数名、变量名、参数名）
 renamer = true
 
-# 混淆完成后删除字节码中的 @Native 注解
-remove_native_annotation = true
+# 混淆完成后删除字节码中的 jnic 相关注解及注解 class 文件
+remove_jnic_annotation = true
 
 # 启用 -ffast-math 浮点优化（允许 FP 重排以启用 SIMD 向量化，有微小精度差异）
 fast_math = true
+
+# 增强加密模式：decode_key 存储在 JAR 静态字段中，DLL 无法静态还原
+# false = 单 key 模式 (J)，性能更好，解密完全在 native 内联完成
+# true  = 双 key 模式 (JJ)，安全性更高，需要 JVM + DLL 协作解密
+enchanted_encryption = false
 
 # 输入JAR
 input_jar = "./input.jar"

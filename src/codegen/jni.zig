@@ -64,6 +64,8 @@ const encrypt_mod = @import("../transform/encrypt.zig");
 
 const transpile = @import("transpile.zig");
 
+const array_encrypt_mod = @import("../transform/array_encrypt.zig");
+
 pub fn generateJniSource(
     allocator: std.mem.Allocator,
     methods: []const nativize.ExtractedMethod,
@@ -72,6 +74,8 @@ pub fn generateJniSource(
     renamer: bool,
     enc_strings: []const encrypt_mod.EncryptedString,
     enc_numbers: []const encrypt_mod.EncryptedNumber,
+    enc_arrays: []const array_encrypt_mod.EncryptedArray,
+    enchanted: bool,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -190,9 +194,12 @@ pub fn generateJniSource(
         var vbuf: [32]u8 = undefined;
         const vp = names.varPrefix(&vbuf, idx);
 
+        // Apply superinstruction optimization to bytecode
+        const optimized_code = try applySuperInstructions(allocator, method.code_data);
+
         // Bytecode array
         try buf.print(allocator, "static const uint8_t _b_{s}[] = {{", .{vp});
-        for (method.code_data, 0..) |byte, i| {
+        for (optimized_code, 0..) |byte, i| {
             if (i % 16 == 0) try buf.appendSlice(allocator, "\n    ");
             try buf.print(allocator, "0x{x:0>2},", .{byte});
         }
@@ -240,10 +247,13 @@ pub fn generateJniSource(
     }
 
     // Generate encrypted constant lookup functions (always emit tables, even if empty)
-    try generateEncryptedLookups(allocator, &buf, enc_strings, enc_numbers, master_key);
+    try generateEncryptedLookups(allocator, &buf, enc_strings, enc_numbers, master_key, enchanted);
+
+    // Generate encrypted array blob functions
+    try generateArrayBlobs(allocator, &buf, enc_arrays, master_key);
 
     // Generate JNI_OnLoad (including encrypted lookup registrations)
-    try generateOnLoad(allocator, &buf, methods, &names, enc_strings, enc_numbers, anti_debug);
+    try generateOnLoad(allocator, &buf, methods, &names, enc_strings, enc_numbers, enc_arrays, anti_debug, enchanted);
 
     return buf.toOwnedSlice(allocator);
 }
@@ -379,7 +389,106 @@ fn generateStub(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), method: n
     try buf.appendSlice(allocator, "}\n\n");
 }
 
-fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods: []const nativize.ExtractedMethod, names: *Names, enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber, anti_debug: bool) !void {
+/// Generate encrypted array blob tables and native array construction functions
+fn generateArrayBlobs(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc_arrays: []const array_encrypt_mod.EncryptedArray, master_key: i64) !void {
+    if (enc_arrays.len == 0) return;
+
+    try buf.appendSlice(allocator, "/* === Encrypted array blobs === */\n");
+
+    for (enc_arrays, 0..) |arr, idx| {
+        // Encrypt the blob data using Feistel cipher
+        const encrypted = try encryptBlob(allocator, arr.data, arr.key, master_key);
+
+        // Emit encrypted blob as static array
+        try buf.print(allocator, "static const uint8_t _earr_{d}[] = {{", .{idx});
+        for (encrypted, 0..) |b, i| {
+            if (i % 16 == 0) try buf.appendSlice(allocator, "\n    ");
+            try buf.print(allocator, "0x{x:0>2},", .{b});
+        }
+        try buf.appendSlice(allocator, "\n};\n");
+
+        // Emit native C buffer for direct access (zero JNI overhead)
+        const c_elem_type = switch (arr.elem_type) {
+            .int => "jint", .long => "jlong", .float => "jfloat",
+            .double => "jdouble", .byte => "jbyte", .short => "jshort",
+            .char => "jchar", .string => "void*",
+        };
+        try buf.print(allocator, "static {s} _narr_{d}[{d}];\nstatic int _narr_{d}_ok = 0;\n", .{ c_elem_type, idx, arr.length, idx });
+
+        // Generate native function: decrypts blob, caches in C buffer, returns JNI array
+        const jni_arr_type = switch (arr.elem_type) {
+            .int => "jintArray", .long => "jlongArray", .float => "jfloatArray",
+            .double => "jdoubleArray", .byte => "jbyteArray", .short => "jshortArray",
+            .char => "jcharArray", .string => "jobjectArray",
+        };
+        const new_func = switch (arr.elem_type) {
+            .int => "NewIntArray", .long => "NewLongArray", .float => "NewFloatArray",
+            .double => "NewDoubleArray", .byte => "NewByteArray", .short => "NewShortArray",
+            .char => "NewCharArray", .string => "SKIP",
+        };
+
+        try buf.print(allocator, "static {s} _arr_f{d}(JNIEnv *env, jclass c, jlong key) {{\n    (void)c;\n", .{ jni_arr_type, idx });
+        // Decrypt into native buffer (cached, only once)
+        try buf.print(allocator, "    if(!_narr_{d}_ok) {{\n", .{idx});
+        try buf.print(allocator, "        int64_t dk = key ^ __runtime_master_key;\n        uint8_t *dkb = (uint8_t*)&dk;\n        uint8_t *mk = (uint8_t*)&__runtime_master_key;\n", .{});
+        try buf.print(allocator, "        uint8_t dec[{d}];\n", .{arr.data.len});
+        try buf.print(allocator, "        for(int i=0;i<{d};i++) dec[i]=_db(_earr_{d}[i],dkb,mk,i);\n", .{ arr.data.len, idx });
+        try buf.print(allocator, "        memcpy(_narr_{d}, dec, {d});\n        _narr_{d}_ok = 1;\n    }}\n", .{ idx, arr.data.len, idx });
+
+        if (arr.elem_type == .string) {
+            try buf.print(allocator, "    jclass str_cls = (*env)->FindClass(env, \"java/lang/String\");\n", .{});
+            try buf.print(allocator, "    jobjectArray arr = (*env)->NewObjectArray(env, {d}, str_cls, NULL);\n", .{arr.length});
+            try buf.appendSlice(allocator, "    uint8_t *p = (uint8_t*)_narr_");
+            try buf.print(allocator, "{d};\n    for(int i=0;i<{d};i++) {{\n", .{ idx, arr.length });
+            try buf.appendSlice(allocator, "        uint16_t slen = (p[0]<<8)|p[1]; p+=2;\n");
+            try buf.appendSlice(allocator, "        char *s = (char*)malloc(slen+1); memcpy(s,p,slen); s[slen]=0; p+=slen;\n");
+            try buf.appendSlice(allocator, "        (*env)->SetObjectArrayElement(env, arr, i, (*env)->NewStringUTF(env, s)); free(s);\n    }\n");
+        } else {
+            try buf.print(allocator, "    {s} arr = (*env)->{s}(env, {d});\n", .{ jni_arr_type, new_func, arr.length });
+            const set_func = switch (arr.elem_type) {
+                .int => "SetIntArrayRegion", .long => "SetLongArrayRegion",
+                .float => "SetFloatArrayRegion", .double => "SetDoubleArrayRegion",
+                .byte => "SetByteArrayRegion", .short => "SetShortArrayRegion",
+                .char => "SetCharArrayRegion", .string => unreachable,
+            };
+            try buf.print(allocator, "    (*env)->{s}(env, arr, 0, {d}, (void*)_narr_{d});\n", .{ set_func, arr.length, idx });
+        }
+        try buf.appendSlice(allocator, "    return arr;\n}\n\n");
+    }
+}
+
+fn encryptBlob(allocator: std.mem.Allocator, data: []const u8, key: i64, master_key: i64) ![]u8 {
+    const combined: i64 = key ^ master_key;
+    const dk_bytes = @as([8]u8, @bitCast(combined));
+    const mk_bytes = @as([8]u8, @bitCast(master_key));
+
+    // Generate S-Box from master_key — MUST match generateEncryptedLookups (Fisher-Yates, 255→1)
+    var sbox: [256]u8 = undefined;
+    for (0..256) |i| sbox[i] = @intCast(i);
+    var rng: u64 = @bitCast(master_key);
+    var si: usize = 255;
+    while (si > 0) : (si -= 1) {
+        rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27; rng *%= 0x2545F4914F6CDD1D;
+        const j = rng % (si + 1);
+        const tmp = sbox[si]; sbox[si] = sbox[j]; sbox[j] = tmp;
+    }
+
+    var result = try allocator.alloc(u8, data.len);
+    for (data, 0..) |byte, i| {
+        var v: u8 = byte;
+        // 4-round Feistel: sbox → rotate_left(3) → xor(dk) → add(mk)
+        for (0..4) |r| {
+            v = sbox[v];
+            v = (v << 3) | (v >> 5);
+            v ^= dk_bytes[(i + r) % 8];
+            v +%= mk_bytes[r % 8];
+        }
+        result[i] = v;
+    }
+    return result;
+}
+
+fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods: []const nativize.ExtractedMethod, names: *Names, enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber, enc_arrays: []const array_encrypt_mod.EncryptedArray, anti_debug: bool, enc_mode: bool) !void {
     try buf.appendSlice(allocator,
         \\JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
         \\    JNIEnv *env;
@@ -405,21 +514,67 @@ fn generateOnLoad(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), methods
         );
     }
 
-    try generateEncryptedRegistrations(allocator, buf, enc_strings, enc_numbers);
+    try generateEncryptedRegistrations(allocator, buf, enc_strings, enc_numbers, enc_mode);
 
-    for (methods, 0..) |method, idx| {
-        var fnb: [32]u8 = undefined;
-        const fn_name = names.funcName(&fnb, idx);
-        try buf.print(allocator,
-            \\    {{
-            \\        jclass cls = (*env)->FindClass(env, "{s}");
-            \\        if (cls) {{
-            \\            JNINativeMethod nm = {{"{s}", "{s}", (void*){s}}};
-            \\            (*env)->RegisterNatives(env, cls, &nm, 1);
-            \\        }}
-            \\    }}
-            \\
-        , .{ method.class_name, method.method_name, method.descriptor, fn_name });
+    // Group methods by class and batch RegisterNatives
+    var class_indices: [256]usize = undefined; // start index per class group
+    var class_counts: [256]usize = undefined;
+    var class_names: [256][]const u8 = undefined;
+    var num_classes: usize = 0;
+
+    for (methods) |method| {
+        var found = false;
+        for (0..num_classes) |ci| {
+            if (std.mem.eql(u8, class_names[ci], method.class_name)) { class_counts[ci] += 1; found = true; break; }
+        }
+        if (!found and num_classes < 256) {
+            class_names[num_classes] = method.class_name;
+            class_counts[num_classes] = 1;
+            class_indices[num_classes] = 0;
+            num_classes += 1;
+        }
+    }
+
+    // Emit batched RegisterNatives per class
+    for (0..num_classes) |ci| {
+        try buf.print(allocator, "    {{\n        jclass cls = (*env)->FindClass(env, \"{s}\");\n        if (cls) {{\n            JNINativeMethod nms[] = {{\n", .{class_names[ci]});
+        var count: usize = 0;
+        for (methods, 0..) |method, idx| {
+            if (!std.mem.eql(u8, method.class_name, class_names[ci])) continue;
+            var fnb: [32]u8 = undefined;
+            const fn_name = names.funcName(&fnb, idx);
+            try buf.print(allocator, "                {{\"{s}\", \"{s}\", (void*){s}}},\n", .{ method.method_name, method.descriptor, fn_name });
+            count += 1;
+        }
+        try buf.print(allocator, "            }};\n            (*env)->RegisterNatives(env, cls, nms, {d});\n        }}\n    }}\n", .{count});
+    }
+
+    // Register encrypted array native methods
+    if (enc_arrays.len > 0) {
+        // Group arrays by class
+        var arr_classes: [64][]const u8 = undefined;
+        var num_arr_classes: usize = 0;
+        for (enc_arrays) |arr| {
+            var found = false;
+            for (0..num_arr_classes) |ci| {
+                if (std.mem.eql(u8, arr_classes[ci], arr.class_name)) { found = true; break; }
+            }
+            if (!found and num_arr_classes < 64) {
+                arr_classes[num_arr_classes] = arr.class_name;
+                num_arr_classes += 1;
+            }
+        }
+        for (0..num_arr_classes) |ci| {
+            try buf.print(allocator, "    {{\n        jclass cls = (*env)->FindClass(env, \"{s}\");\n        if (cls) {{\n            JNINativeMethod nms[] = {{\n", .{arr_classes[ci]});
+            var acount: usize = 0;
+            for (enc_arrays, 0..) |arr, aidx| {
+                if (!std.mem.eql(u8, arr.class_name, arr_classes[ci])) continue;
+                const desc = array_encrypt_mod.arrayMethodDesc(arr.elem_type);
+                try buf.print(allocator, "                {{\"jnic$arr${d}\", \"{s}\", (void*)_arr_f{d}}},\n", .{ aidx, desc, aidx });
+                acount += 1;
+            }
+            try buf.print(allocator, "            }};\n            (*env)->RegisterNatives(env, cls, nms, {d});\n        }}\n    }}\n", .{acount});
+        }
     }
 
     try buf.appendSlice(allocator,
@@ -436,6 +591,7 @@ fn generateEncryptedRegistrations(
     buf: *std.ArrayList(u8),
     enc_strings: []const encrypt_mod.EncryptedString,
     enc_numbers: []const encrypt_mod.EncryptedNumber,
+    enc_mode: bool,
 ) !void {
     if (enc_strings.len == 0 and enc_numbers.len == 0) return;
 
@@ -453,7 +609,7 @@ fn generateEncryptedRegistrations(
                 registered_classes[num_registered] = s.class_name;
                 num_registered += 1;
             }
-            try emitEncryptedRegistration(allocator, buf, s.class_name);
+            try emitEncryptedRegistration(allocator, buf, s.class_name, enc_mode);
         }
     }
     for (enc_numbers) |n| {
@@ -462,28 +618,31 @@ fn generateEncryptedRegistrations(
                 registered_classes[num_registered] = n.class_name;
                 num_registered += 1;
             }
-            try emitEncryptedRegistration(allocator, buf, n.class_name);
+            try emitEncryptedRegistration(allocator, buf, n.class_name, enc_mode);
         }
     }
 }
 
-fn emitEncryptedRegistration(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), class_name: []const u8) !void {
+fn emitEncryptedRegistration(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), class_name: []const u8, enchanted: bool) !void {
     try buf.print(allocator,
         \\    {{
         \\        jclass cls = (*env)->FindClass(env, "{s}");
         \\        if (cls) {{
         \\            JNINativeMethod nms[] = {{
-        \\                {{"jnic$native_string", "(JJ)Ljava/lang/String;", (void*)_ns}},
-        \\                {{"jnic$native_int", "(JJ)I", (void*)_ni}},
-        \\                {{"jnic$native_long", "(JJ)J", (void*)_nl}},
-        \\                {{"jnic$native_float", "(JJ)F", (void*)_nf}},
-        \\                {{"jnic$native_double", "(JJ)D", (void*)_nd}}
-        \\            }};
-        \\            (*env)->RegisterNatives(env, cls, nms, 5);
-        \\        }}
-        \\    }}
-        \\
     , .{class_name});
+    const key_desc: []const u8 = if (enchanted) "(JJ)" else "(J)";
+    try buf.print(allocator, "                {{\"jnic$native_string\", \"{s}Ljava/lang/String;\", (void*)_ns}},\n", .{key_desc});
+    try buf.print(allocator, "                {{\"jnic$native_int\", \"{s}I\", (void*)_ni}},\n", .{key_desc});
+    try buf.print(allocator, "                {{\"jnic$native_long\", \"{s}J\", (void*)_nl}},\n", .{key_desc});
+    try buf.print(allocator, "                {{\"jnic$native_float\", \"{s}F\", (void*)_nf}},\n", .{key_desc});
+    try buf.print(allocator, "                {{\"jnic$native_double\", \"{s}D\", (void*)_nd}}\n", .{key_desc});
+    try buf.appendSlice(allocator,
+        \\            };
+        \\            (*env)->RegisterNatives(env, cls, nms, 5);
+        \\        }
+        \\    }
+        \\
+    );
 }
 
 fn classAlreadyRegistered(list: []const []const u8, count: usize, name: []const u8) bool {
@@ -491,7 +650,7 @@ fn classAlreadyRegistered(list: []const []const u8, count: usize, name: []const 
     return false;
 }
 
-fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber, master_key: i64) !void {
+fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), enc_strings: []const encrypt_mod.EncryptedString, enc_numbers: []const encrypt_mod.EncryptedNumber, master_key: i64, enchanted: bool) !void {
     try buf.appendSlice(allocator, "\n/* === Encrypted constants (multi-round cipher) === */\n");
 
     // Generate per-build S-Box from master_key (deterministic but unique per build)
@@ -592,48 +751,96 @@ fn generateEncryptedLookups(allocator: std.mem.Allocator, buf: *std.ArrayList(u8
         \\    }
         \\    return v;
         \\}
-        \\static jobject _ns(JNIEnv *env, jclass c, jlong key, jlong dk) {
-        \\    (void)c;
-        \\    int64_t dk64 = key ^ dk ^ __runtime_master_key;
-        \\    uint8_t *dkb = (uint8_t*)&dk64;
-        \\    uint8_t *mk = (uint8_t*)&__runtime_master_key;
-        \\    for (int i = 0; _enc_strs[i].enc != NULL; i++) {
-        \\        if (_enc_strs[i].key == key) {
-        \\            if (i < 256 && _str_cached[i]) return _str_cache[i];
-        \\            int32_t len = _enc_strs[i].len;
-        \\            char *d = (char*)malloc(len+1);
-        \\            for (int j=0;j<len;j++) d[j]=_db((uint8_t)_enc_strs[i].enc[j],dkb,mk,j);
-        \\            d[len]=0;
-        \\            jstring r=(*env)->NewStringUTF(env,d); free(d);
-        \\            if(i<256){_str_cache[i]=(*env)->NewGlobalRef(env,r);_str_cached[i]=1;}
-        \\            return r;
-        \\        }
-        \\    }
-        \\    return (*env)->NewStringUTF(env,"");
-        \\}
-        \\static jint _ni(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
-        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
-        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==0){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jint r;memcpy(&r,d,4);return r;}}
-        \\    return 0;}
-        \\static jlong _nl(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
-        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
-        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==1){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jlong r;memcpy(&r,d,8);return r;}}
-        \\    return 0;}
-        \\static jfloat _nf(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
-        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
-        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==2){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[4];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jfloat r;memcpy(&r,d,4);return r;}}
-        \\    return 0.0f;}
-        \\static jdouble _nd(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
-        \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
-        \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
-        \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==3){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jdouble r;memcpy(&r,d,8);return r;}}
-        \\    return 0.0;}
-        \\
         \\
     );
+    // Generate stubs with single-key (J) or dual-key (JJ) based on enchanted mode
+    if (enchanted) {
+        try buf.appendSlice(allocator,
+            \\static jobject _ns(JNIEnv *env, jclass c, jlong key, jlong dk) {
+            \\    (void)c;
+            \\    int64_t dk64 = key ^ dk ^ __runtime_master_key;
+            \\    uint8_t *dkb = (uint8_t*)&dk64;
+            \\    uint8_t *mk = (uint8_t*)&__runtime_master_key;
+            \\    for (int i = 0; _enc_strs[i].enc != NULL; i++) {
+            \\        if (_enc_strs[i].key == key) {
+            \\            if (i < 256 && _str_cached[i]) return _str_cache[i];
+            \\            int32_t len = _enc_strs[i].len;
+            \\            char *d = (char*)malloc(len+1);
+            \\            for (int j=0;j<len;j++) d[j]=_db((uint8_t)_enc_strs[i].enc[j],dkb,mk,j);
+            \\            d[len]=0;
+            \\            jstring r=(*env)->NewStringUTF(env,d); free(d);
+            \\            if(i<256){_str_cache[i]=(*env)->NewGlobalRef(env,r);_str_cached[i]=1;}
+            \\            return r;
+            \\        }
+            \\    }
+            \\    return (*env)->NewStringUTF(env,"");
+            \\}
+            \\static jint _ni(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+            \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==0){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jint r;memcpy(&r,d,4);return r;}}
+            \\    return 0;}
+            \\static jlong _nl(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+            \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==1){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jlong r;memcpy(&r,d,8);return r;}}
+            \\    return 0;}
+            \\static jfloat _nf(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+            \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==2){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[4];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jfloat r;memcpy(&r,d,4);return r;}}
+            \\    return 0.0f;}
+            \\static jdouble _nd(JNIEnv *e,jclass c,jlong key,jlong dk){(void)e;(void)c;
+            \\    int64_t dk64=key^dk^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==3){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jdouble r;memcpy(&r,d,8);return r;}}
+            \\    return 0.0;}
+            \\
+        );
+    } else {
+        try buf.appendSlice(allocator,
+            \\static jobject _ns(JNIEnv *env, jclass c, jlong key) {
+            \\    (void)c;
+            \\    int64_t dk64 = key ^ __runtime_master_key;
+            \\    uint8_t *dkb = (uint8_t*)&dk64;
+            \\    uint8_t *mk = (uint8_t*)&__runtime_master_key;
+            \\    for (int i = 0; _enc_strs[i].enc != NULL; i++) {
+            \\        if (_enc_strs[i].key == key) {
+            \\            if (i < 256 && _str_cached[i]) return _str_cache[i];
+            \\            int32_t len = _enc_strs[i].len;
+            \\            char *d = (char*)malloc(len+1);
+            \\            for (int j=0;j<len;j++) d[j]=_db((uint8_t)_enc_strs[i].enc[j],dkb,mk,j);
+            \\            d[len]=0;
+            \\            jstring r=(*env)->NewStringUTF(env,d); free(d);
+            \\            if(i<256){_str_cache[i]=(*env)->NewGlobalRef(env,r);_str_cached[i]=1;}
+            \\            return r;
+            \\        }
+            \\    }
+            \\    return (*env)->NewStringUTF(env,"");
+            \\}
+            \\static jint _ni(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+            \\    int64_t dk64=key^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==0){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jint r;memcpy(&r,d,4);return r;}}
+            \\    return 0;}
+            \\static jlong _nl(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+            \\    int64_t dk64=key^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==1){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jlong r;memcpy(&r,d,8);return r;}}
+            \\    return 0;}
+            \\static jfloat _nf(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+            \\    int64_t dk64=key^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==2){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[4];for(int j=0;j<4;j++)d[j]=_db(ev[j],dkb,mk,j);jfloat r;memcpy(&r,d,4);return r;}}
+            \\    return 0.0f;}
+            \\static jdouble _nd(JNIEnv *e,jclass c,jlong key){(void)e;(void)c;
+            \\    int64_t dk64=key^__runtime_master_key;uint8_t*dkb=(uint8_t*)&dk64;uint8_t*mk=(uint8_t*)&__runtime_master_key;
+            \\    for(int i=0;_enc_nums[i].key!=0||_enc_nums[i].enc_val!=0;i++){
+            \\        if(_enc_nums[i].key==key&&_enc_nums[i].kind==3){uint8_t*ev=(uint8_t*)&_enc_nums[i].enc_val;uint8_t d[8];for(int j=0;j<8;j++)d[j]=_db(ev[j],dkb,mk,j);jdouble r;memcpy(&r,d,8);return r;}}
+            \\    return 0.0;}
+            \\
+        );
+    }
 }
 
 
@@ -735,4 +942,134 @@ fn countSlots(desc: []const u8) u16 {
         }
     }
     return slots;
+}
+
+/// Superinstruction opcodes
+const SUPER_IINC_GOTO: u8 = 0xfe; // iinc + goto backward: [0xfe, idx, inc, off_hi, off_lo]
+const SUPER_ILOAD_CMP: u8 = 0xfd; // iload + iload + if_icmpXX: [0xfd, loc1, loc2, cmp, off_hi, off_lo]
+
+/// Apply superinstruction optimization to code_attr (header + bytecode + rest)
+fn applySuperInstructions(allocator: std.mem.Allocator, code_data: []const u8) ![]u8 {
+    if (code_data.len < 8) return try allocator.dupe(u8, code_data);
+
+    const code_len = (@as(u32, code_data[4]) << 24) | (@as(u32, code_data[5]) << 16) |
+        (@as(u32, code_data[6]) << 8) | @as(u32, code_data[7]);
+    if (8 + code_len > code_data.len) return try allocator.dupe(u8, code_data);
+
+    const code = code_data[8 .. 8 + code_len];
+    const rest = code_data[8 + code_len ..];
+
+    // First pass: find all branch targets (can't merge across them)
+    var targets = try allocator.alloc(bool, code_len);
+    defer allocator.free(targets);
+    @memset(targets, false);
+
+    var pc: u32 = 0;
+    while (pc < code_len) {
+        const op = code[pc];
+        switch (op) {
+            0x99...0xa7, 0xc6, 0xc7 => { // short branches + goto
+                const off = @as(i16, @bitCast((@as(u16, code[pc + 1]) << 8) | @as(u16, code[pc + 2])));
+                const tgt: i32 = @as(i32, @intCast(pc)) + @as(i32, off);
+                if (tgt >= 0 and tgt < @as(i32, @intCast(code_len))) targets[@intCast(tgt)] = true;
+            },
+            0xc8 => { // goto_w
+                const off = @as(i32, @bitCast((@as(u32, code[pc + 1]) << 24) | (@as(u32, code[pc + 2]) << 16) | (@as(u32, code[pc + 3]) << 8) | @as(u32, code[pc + 4])));
+                const tgt: i32 = @as(i32, @intCast(pc)) + off;
+                if (tgt >= 0 and tgt < @as(i32, @intCast(code_len))) targets[@intCast(tgt)] = true;
+            },
+            else => {},
+        }
+        pc += opcodeLength(code, pc, code_len);
+    }
+
+    // Second pass: apply superinstruction rewrites (in-place, same size)
+    var out = try allocator.alloc(u8, code_data.len);
+    @memcpy(out[0..8], code_data[0..8]); // header
+    @memcpy(out[8 .. 8 + code_len], code); // bytecode
+    @memcpy(out[8 + code_len ..], rest); // rest
+    const oc = out[8 .. 8 + code_len];
+
+    pc = 0;
+    while (pc < code_len) {
+        const op = oc[pc];
+        // Pattern 1: iinc(3) + goto(3) with backward offset → SUPER_IINC_GOTO(5) + nop(1)
+        if (op == 0x84 and pc + 6 <= code_len) {
+            const next_pc = pc + 3;
+            if (!targets[next_pc] and oc[next_pc] == 0xa7) { // goto
+                const goto_off = @as(i16, @bitCast((@as(u16, oc[next_pc + 1]) << 8) | @as(u16, oc[next_pc + 2])));
+                if (goto_off < 0) { // backward jump (loop)
+                    // target = (pc+3) + goto_off; super_off = target - pc = goto_off + 3
+                    const combined_off: i16 = goto_off + 3;
+                    oc[pc] = SUPER_IINC_GOTO;
+                    // oc[pc+1] = idx (already there from iinc)
+                    // oc[pc+2] = inc (already there from iinc)
+                    oc[pc + 3] = @intCast(@as(u16, @bitCast(combined_off)) >> 8);
+                    oc[pc + 4] = @intCast(@as(u16, @bitCast(combined_off)) & 0xff);
+                    oc[pc + 5] = 0x00; // nop padding
+                    pc += 6;
+                    continue;
+                }
+            }
+        }
+        // Pattern 2: iload_X(1) + iload_Y(1) + if_icmpXX(3) → SUPER_ILOAD_CMP(6) (save size by NOP is not possible if 5→6)
+        // Actually 1+1+3=5 bytes, super is 6 bytes — doesn't fit. Skip this pattern for same-size constraint.
+        // Instead: iload(2) + iload(2) + if_icmpXX(3) = 7 → SUPER_ILOAD_CMP(6) + nop(1)
+        if (op == 0x15 and pc + 7 <= code_len) { // iload
+            const next_pc = pc + 2;
+            if (!targets[next_pc] and oc[next_pc] == 0x15) { // iload
+                const third_pc = next_pc + 2;
+                if (!targets[third_pc] and oc[third_pc] >= 0x9f and oc[third_pc] <= 0xa4) { // if_icmpXX
+                    const cmp_type: u8 = oc[third_pc] - 0x9f; // 0=eq,1=ne,2=lt,3=ge,4=gt,5=le
+                    // Remap: if_icmpeq=0x9f→4(eq), ne=0xa0→5(ne), lt=0xa1→0(lt), ge=0xa2→1(ge), gt=0xa3→2(gt), le=0xa4→3(le)
+                    const cmp_remap = [_]u8{ 4, 5, 0, 1, 2, 3 };
+                    // Original offset relative to third_pc; adjust to be relative to pc
+                    const raw_off = @as(i16, @bitCast((@as(u16, oc[third_pc + 1]) << 8) | @as(u16, oc[third_pc + 2])));
+                    const adj_off: i16 = raw_off + 4; // target = (pc+4)+raw_off, super needs pc+adj_off
+                    oc[pc] = SUPER_ILOAD_CMP;
+                    oc[pc + 1] = oc[pc + 1]; // local1 (already there)
+                    oc[pc + 2] = oc[next_pc + 1]; // local2
+                    oc[pc + 3] = cmp_remap[cmp_type];
+                    oc[pc + 4] = @intCast(@as(u16, @bitCast(adj_off)) >> 8);
+                    oc[pc + 5] = @intCast(@as(u16, @bitCast(adj_off)) & 0xff);
+                    oc[pc + 6] = 0x00; // nop
+                    pc += 7;
+                    continue;
+                }
+            }
+        }
+        pc += opcodeLength(oc, pc, code_len);
+    }
+
+    return out;
+}
+
+fn opcodeLength(code: []const u8, pc: u32, code_len: u32) u32 {
+    if (pc >= code_len) return 1;
+    const op = code[pc];
+    return switch (op) {
+        0x10 => 2, 0x11 => 3, 0x12 => 2, 0x13, 0x14 => 3,
+        0x15...0x19 => 2, 0x36...0x3a => 2, 0x84 => 3,
+        0x99...0xa7 => 3, 0xc6, 0xc7 => 3, 0xc8 => 5,
+        0xb2...0xb8 => 3, 0xb9 => 5, 0xba => 5,
+        0xbb, 0xbd, 0xc0, 0xc1 => 3, 0xbc => 2, 0xc5 => 4,
+        SUPER_IINC_GOTO => 6, // our super: 0xfe
+        SUPER_ILOAD_CMP => 7, // our super: 0xfd (6 + 1 nop)
+        0xaa => blk: { // tableswitch
+            const pp = (pc + 4) & ~@as(u32, 3);
+            if (pp + 12 > code_len) break :blk 1;
+            const lo: i32 = @bitCast((@as(u32, code[pp + 4]) << 24) | (@as(u32, code[pp + 5]) << 16) | (@as(u32, code[pp + 6]) << 8) | @as(u32, code[pp + 7]));
+            const hi: i32 = @bitCast((@as(u32, code[pp + 8]) << 24) | (@as(u32, code[pp + 9]) << 16) | (@as(u32, code[pp + 10]) << 8) | @as(u32, code[pp + 11]));
+            const cnt: u32 = @intCast(@as(i64, hi) - @as(i64, lo) + 1);
+            break :blk pp + 12 + cnt * 4 - pc;
+        },
+        0xab => blk: { // lookupswitch
+            const pp = (pc + 4) & ~@as(u32, 3);
+            if (pp + 8 > code_len) break :blk 1;
+            const np: u32 = @intCast(@as(i32, @bitCast((@as(u32, code[pp + 4]) << 24) | (@as(u32, code[pp + 5]) << 16) | (@as(u32, code[pp + 6]) << 8) | @as(u32, code[pp + 7]))));
+            break :blk pp + 8 + np * 8 - pc;
+        },
+        0xc4 => if (pc + 1 < code_len and code[pc + 1] == 0x84) 6 else 4,
+        else => 1,
+    };
 }

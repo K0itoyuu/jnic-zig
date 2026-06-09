@@ -64,7 +64,7 @@ pub fn nativize(allocator: std.mem.Allocator, cf: *types.ClassFile) !NativizeRes
             });
         }
     } else if (anno.class_annotated) {
-        // No main but has @Native — still inject loadLibrary into <clinit>
+        // No main but has @Native — still inject NativeLoader.load() into <clinit>
         try injectLoadLibrary(allocator, cf);
     }
 
@@ -102,18 +102,16 @@ pub fn nativize(allocator: std.mem.Allocator, cf: *types.ClassFile) !NativizeRes
     };
 }
 
-/// Inject System.loadLibrary("yurijvm_native") into <clinit> for classes without main
+/// Inject master/koitoyuu/jnic/NativeLoader.load()V into <clinit>
 fn injectLoadLibrary(allocator: std.mem.Allocator, cf: *types.ClassFile) !void {
-    const cp_system_name = try findOrAddUtf8(allocator, cf, "java/lang/System");
-    const cp_loadlib_name = try findOrAddUtf8(allocator, cf, "loadLibrary");
-    const cp_str_void_desc = try findOrAddUtf8(allocator, cf, "(Ljava/lang/String;)V");
-    const cp_lib_name = try findOrAddUtf8(allocator, cf, "yurijvm_native");
+    const cp_loader_name = try findOrAddUtf8(allocator, cf, "master/koitoyuu/jnic/NativeLoader");
+    const cp_load_name = try findOrAddUtf8(allocator, cf, "load");
+    const cp_void_desc = try findOrAddUtf8(allocator, cf, "()V");
     const cp_code_name = try findOrAddUtf8(allocator, cf, "Code");
-    const cp_system_class = try addCpEntry(allocator, cf, types.CpInfo{ .class = cp_system_name });
-    const cp_lib_string = try addCpEntry(allocator, cf, types.CpInfo{ .string = cp_lib_name });
-    const cp_loadlib_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_loadlib_name, .descriptor_index = cp_str_void_desc } });
-    const cp_loadlib_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cp_system_class, .name_and_type_index = cp_loadlib_nat } });
-    try addOrModifyClinit(allocator, cf, cp_code_name, cp_lib_string, cp_loadlib_ref);
+    const cp_loader_class = try addCpEntry(allocator, cf, types.CpInfo{ .class = cp_loader_name });
+    const cp_load_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_load_name, .descriptor_index = cp_void_desc } });
+    const cp_load_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cp_loader_class, .name_and_type_index = cp_load_nat } });
+    try addOrModifyClinit(allocator, cf, cp_code_name, cp_load_ref);
 }
 
 /// Transform main: extract body to jnic$main (native), rewrite main to load lib + call jnic$main
@@ -139,35 +137,30 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
     // Add constant pool entries we need:
     // - Utf8 "jnic$main"
     // - Utf8 "([Ljava/lang/String;)V"  (already exists for main)
-    // - Utf8 "java/lang/System"
-    // - Utf8 "loadLibrary"
-    // - Utf8 "(Ljava/lang/String;)V"
-    // - Utf8 "yurijvm_native"
+    // - Utf8 "master/koitoyuu/jnic/NativeLoader"
+    // - Utf8 "load"
+    // - Utf8 "()V"
     // - Utf8 "Code"
-    // - Class java/lang/System
-    // - String "yurijvm_native"
-    // - NameAndType loadLibrary:(Ljava/lang/String;)V
-    // - Methodref System.loadLibrary
+    // - Class NativeLoader
+    // - NameAndType load:()V
+    // - Methodref NativeLoader.load
     // - NameAndType jnic$main:([Ljava/lang/String;)V
     // - Methodref thisClass.jnic$main
 
     // Find or add UTF8 entries
     const cp_yuri_main = try findOrAddUtf8(allocator, cf, "jnic$main");
     const cp_main_desc = try findOrAddUtf8(allocator, cf, "([Ljava/lang/String;)V");
-    const cp_system_name = try findOrAddUtf8(allocator, cf, "java/lang/System");
-    const cp_loadlib_name = try findOrAddUtf8(allocator, cf, "loadLibrary");
-    const cp_str_void_desc = try findOrAddUtf8(allocator, cf, "(Ljava/lang/String;)V");
-    const cp_lib_name = try findOrAddUtf8(allocator, cf, "yurijvm_native");
+    const cp_loader_name = try findOrAddUtf8(allocator, cf, "master/koitoyuu/jnic/NativeLoader");
+    const cp_load_name = try findOrAddUtf8(allocator, cf, "load");
+    const cp_void_desc = try findOrAddUtf8(allocator, cf, "()V");
     const cp_code_name = try findOrAddUtf8(allocator, cf, "Code");
 
-    // Add Class entry for System
-    const cp_system_class = try addCpEntry(allocator, cf, types.CpInfo{ .class = cp_system_name });
-    // Add String entry for "yurijvm_native"
-    const cp_lib_string = try addCpEntry(allocator, cf, types.CpInfo{ .string = cp_lib_name });
-    // Add NameAndType for loadLibrary:(Ljava/lang/String;)V
-    const cp_loadlib_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_loadlib_name, .descriptor_index = cp_str_void_desc } });
-    // Add Methodref for System.loadLibrary
-    const cp_loadlib_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cp_system_class, .name_and_type_index = cp_loadlib_nat } });
+    // Add Class entry for NativeLoader
+    const cp_loader_class = try addCpEntry(allocator, cf, types.CpInfo{ .class = cp_loader_name });
+    // Add NameAndType for load:()V
+    const cp_load_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_load_name, .descriptor_index = cp_void_desc } });
+    // Add Methodref for NativeLoader.load
+    const cp_load_ref = try addCpEntry(allocator, cf, types.CpInfo{ .methodref = .{ .class_index = cp_loader_class, .name_and_type_index = cp_load_nat } });
     // Add NameAndType for jnic$main:([Ljava/lang/String;)V
     const cp_yurimain_nat = try addCpEntry(allocator, cf, types.CpInfo{ .name_and_type = .{ .name_index = cp_yuri_main, .descriptor_index = cp_main_desc } });
     // Add Methodref for thisClass.jnic$main
@@ -212,9 +205,9 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
     main_attrs[0] = main_code_attr;
     cf.methods[main_idx.?].attributes = main_attrs;
 
-    // === Add or modify <clinit> to call System.loadLibrary("yurijvm_native") ===
-    // Bytecode: ldc cp_lib_string, invokestatic cp_loadlib_ref, return
-    try addOrModifyClinit(allocator, cf, cp_code_name, cp_lib_string, cp_loadlib_ref);
+    // === Add or modify <clinit> to call NativeLoader.load() ===
+    // Bytecode: invokestatic cp_load_ref, return
+    try addOrModifyClinit(allocator, cf, cp_code_name, cp_load_ref);
 
     // === Add jnic$main to methods array ===
     var new_methods = try allocator.alloc(types.MethodInfo, cf.methods.len + 1);
@@ -223,7 +216,7 @@ fn transformMain(allocator: std.mem.Allocator, cf: *types.ClassFile, class_name:
     cf.methods = new_methods;
 }
 
-fn addOrModifyClinit(allocator: std.mem.Allocator, cf: *types.ClassFile, cp_code_name: u16, cp_lib_string: u16, cp_loadlib_ref: u16) !void {
+fn addOrModifyClinit(allocator: std.mem.Allocator, cf: *types.ClassFile, cp_code_name: u16, cp_load_ref: u16) !void {
     // Check if <clinit> exists
     var clinit_idx: ?usize = null;
     for (cf.methods, 0..) |method, idx| {
@@ -231,15 +224,13 @@ fn addOrModifyClinit(allocator: std.mem.Allocator, cf: *types.ClassFile, cp_code
         if (std.mem.eql(u8, name, "<clinit>")) { clinit_idx = idx; break; }
     }
 
-    // loadLibrary bytecode: ldc string_idx, invokestatic methodref_idx, return (or pop existing return)
-    // ldc (1 or 2 bytes depending on index), invokestatic (3 bytes)
+    // NativeLoader.load() bytecode: invokestatic methodref_idx (3 bytes)
     const load_lib_code = [_]u8{
-        0x12, @intCast(cp_lib_string & 0xff), // ldc
-        0xb8, @intCast(cp_loadlib_ref >> 8), @intCast(cp_loadlib_ref & 0xff), // invokestatic
+        0xb8, @intCast(cp_load_ref >> 8), @intCast(cp_load_ref & 0xff), // invokestatic
     };
 
     if (clinit_idx) |ci| {
-        // Prepend loadLibrary call to existing clinit code
+        // Prepend NativeLoader.load() call to existing clinit code
         var existing_code: ?[]const u8 = null;
         for (cf.methods[ci].attributes) |attr| {
             const aname = cf.getUtf8(attr.name_index) orelse continue;
@@ -272,18 +263,18 @@ fn addOrModifyClinit(allocator: std.mem.Allocator, cf: *types.ClassFile, cp_code
         }
     } else {
         // Create new <clinit>
-        // Code: max_stack=1, max_locals=0, code_len=6 (ldc + invokestatic + return)
+        // Code: max_stack=0, max_locals=0, code_len=4 (invokestatic + return)
         const clinit_name = try findOrAddUtf8(allocator, cf, "<clinit>");
         const clinit_desc = try findOrAddUtf8(allocator, cf, "()V");
 
-        var code_data: [8 + 6 + 4]u8 = undefined;
-        code_data[0] = 0; code_data[1] = 1; // max_stack=1
+        var code_data: [8 + 4 + 4]u8 = undefined;
+        code_data[0] = 0; code_data[1] = 0; // max_stack=0
         code_data[2] = 0; code_data[3] = 0; // max_locals=0
-        code_data[4] = 0; code_data[5] = 0; code_data[6] = 0; code_data[7] = 6; // code_len=6
-        @memcpy(code_data[8..13], &load_lib_code);
-        code_data[13] = 0xb1; // return
-        code_data[14] = 0; code_data[15] = 0; // exc_table_count=0
-        code_data[16] = 0; code_data[17] = 0; // attrs_count=0
+        code_data[4] = 0; code_data[5] = 0; code_data[6] = 0; code_data[7] = 4; // code_len=4
+        @memcpy(code_data[8..11], &load_lib_code);
+        code_data[11] = 0xb1; // return
+        code_data[12] = 0; code_data[13] = 0; // exc_table_count=0
+        code_data[14] = 0; code_data[15] = 0; // attrs_count=0
 
         const code_slice = try allocator.alloc(u8, code_data.len);
         @memcpy(code_slice, &code_data);

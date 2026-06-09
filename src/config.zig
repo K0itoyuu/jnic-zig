@@ -5,8 +5,9 @@ pub const Config = struct {
     use_ffm: bool = false,
     anti_debug: bool = true,
     renamer: bool = false,
-    remove_native_annotation: bool = false,
+    remove_jnic_annotation: bool = false,
     fast_math: bool = false,
+    enchanted_encryption: bool = false,
     input_jar: []const u8 = "./input.jar",
     output_jar: []const u8 = "./output.jar",
 };
@@ -32,10 +33,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
             config.anti_debug = parseBool(val);
         } else if (std.mem.eql(u8, key, "renamer")) {
             config.renamer = parseBool(val);
-        } else if (std.mem.eql(u8, key, "remove_native_annotation")) {
-            config.remove_native_annotation = parseBool(val);
+        } else if (std.mem.eql(u8, key, "remove_jnic_annotation")) {
+            config.remove_jnic_annotation = parseBool(val);
         } else if (std.mem.eql(u8, key, "fast_math")) {
             config.fast_math = parseBool(val);
+        } else if (std.mem.eql(u8, key, "enchanted_encryption")) {
+            config.enchanted_encryption = parseBool(val);
         } else if (std.mem.eql(u8, key, "input_jar")) {
             config.input_jar = try parseString(allocator, val);
         } else if (std.mem.eql(u8, key, "output_jar")) {

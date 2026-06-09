@@ -98,7 +98,7 @@ fn generateJavaBindings(
         \\    private static final SymbolLookup LIB;
         \\
         \\    static {
-        \\        System.loadLibrary("yurijvm_native");
+        \\        System.loadLibrary("jnic_native");
         \\        LIB = SymbolLookup.loaderLookup();
         \\    }
         \\

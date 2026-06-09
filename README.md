@@ -72,21 +72,21 @@ jnic-zig --config config.toml
 #### Windows
 
 ```bash
-zig cc -shared -o yurijvm_native.dll native_jni.c ^
+zig cc -shared -o jnic_native.dll native_jni.c ^
     -I"%JAVA_HOME%/include" -I"%JAVA_HOME%/include/win32" -O2
 ```
 
 #### Linux
 
 ```bash
-zig cc -shared -fPIC -o libyurijvm_native.so native_jni.c \
+zig cc -shared -fPIC -o libjnic_native.so native_jni.c \
     -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" -O2
 ```
 
 #### macOS
 
 ```bash
-zig cc -shared -o libyurijvm_native.dylib native_jni.c \
+zig cc -shared -o libjnic_native.dylib native_jni.c \
     -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" -O2
 ```
 
