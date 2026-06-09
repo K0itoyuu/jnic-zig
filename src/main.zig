@@ -48,8 +48,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  Output JAR:  {s}\n", .{config.output_jar});
 
     // Extract input JAR to temp directory
-    const tmp_in = ".yurijvm_tmp_in";
-    const tmp_out = ".yurijvm_tmp_out";
+    const tmp_in = ".jnic_temp_in";
+    const tmp_out = ".jnic_temp_out";
 
     // Clean and create temp dirs
     runCmd(allocator, io, &.{ "rm", "-rf", tmp_in, tmp_out });
@@ -137,32 +137,61 @@ pub fn main(init: std.process.Init) !void {
     // Cleanup temp dirs
     runCmd(allocator, io, &.{ "rm", "-rf", tmp_in, tmp_out });
 
-    // Generate launch script
-    if (all_extracted.items.len > 0) {
-        const lib_name = if (config.use_ffm) "jnic_native_ffm" else "jnic_native";
+    // Auto-compile native library and embed into JAR
+    if (all_extracted.items.len > 0 and !config.use_ffm) {
+        std.debug.print("Compiling native library...\n", .{});
+
+        // Detect JAVA_HOME for include paths
+        const java_home = init.environ_map.get("JAVA_HOME") orelse "";
+        const include_path = try std.fmt.allocPrint(allocator, "-I{s}/include", .{java_home});
+        const include_platform = try std.fmt.allocPrint(allocator, "-I{s}/include/win32", .{java_home});
+
+        // Compile DLL
+        const dll_name = "jnic_native.dll";
+        var compile_args = std.ArrayList([]const u8).empty;
+        defer compile_args.deinit(allocator);
+        try compile_args.appendSlice(allocator, &.{ "zig", "cc", "-shared", "-o", dll_name, "native_jni.c", include_path, include_platform, "-O3" });
+        if (config.fast_math) try compile_args.append(allocator, "-ffast-math");
+
+        runCmd(allocator, io, compile_args.items);
+
+        // Embed DLL into output JAR at master/koitoyuu/jnic/
+        const dll_jar_dir = "master/koitoyuu/jnic";
+        Dir.cwd().createDirPath(io, dll_jar_dir) catch {};
+
+        // Copy DLL to jar structure dir
+        const dll_jar_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dll_jar_dir, dll_name });
+        runCmd(allocator, io, &.{ "cp", dll_name, dll_jar_path });
+
+        // Add to JAR
+        runCmd(allocator, io, &.{ "jar", "uf", config.output_jar, dll_jar_path });
+
+        // Cleanup build artifacts
+        Dir.cwd().deleteFile(io, dll_name) catch {};
+        Dir.cwd().deleteFile(io, "native_jni.c") catch {};
+        Dir.cwd().deleteFile(io, dll_jar_path) catch {};
+        runCmd(allocator, io, &.{ "rm", "-rf", dll_jar_dir });
+        // Also remove jnic_native.pdb if exists
+        Dir.cwd().deleteFile(io, "jnic_native.pdb") catch {};
+
+        std.debug.print("\nOutput:\n", .{});
+        std.debug.print("  {s}  - Protected JAR (DLL embedded, auto-loads at runtime)\n", .{config.output_jar});
+
+        // Generate launch scripts
         const script = try std.fmt.allocPrint(allocator,
             \\@echo off
-            \\java -Xss4m -Djava.library.path=. --enable-native-access=ALL-UNNAMED -jar {s} %*
+            \\java -Xss4m --enable-native-access=ALL-UNNAMED -jar {s} %*
             \\
         , .{config.output_jar});
         Dir.cwd().writeFile(io, .{ .sub_path = "run.bat", .data = script }) catch {};
 
         const sh_script = try std.fmt.allocPrint(allocator,
             \\#!/bin/sh
-            \\java -Xss4m -Djava.library.path=. --enable-native-access=ALL-UNNAMED -jar {s} "$@"
+            \\java -Xss4m --enable-native-access=ALL-UNNAMED -jar {s} "$@"
             \\
         , .{config.output_jar});
         Dir.cwd().writeFile(io, .{ .sub_path = "run.sh", .data = sh_script }) catch {};
-
-        std.debug.print("\nOutput:\n", .{});
-        std.debug.print("  {s}          - Protected JAR\n", .{config.output_jar});
-        std.debug.print("  native_jni.c        - Native source (compile with zig cc)\n", .{});
-        std.debug.print("  run.bat / run.sh    - Launch scripts\n", .{});
-        std.debug.print("\nCompile native library:\n", .{});
-        const fmath_flag = if (config.fast_math) " -ffast-math" else "";
-        std.debug.print("  zig cc -shared -o {s}.dll native_jni.c -I\"$JAVA_HOME/include\" -I\"$JAVA_HOME/include/win32\" -O3{s}\n", .{ lib_name, fmath_flag });
-        std.debug.print("\nIMPORTANT: Add System.loadLibrary(\"{s}\") to your main class,\n", .{lib_name});
-        std.debug.print("           or use a java agent to load the native library.\n", .{});
+        std.debug.print("  run.bat / run.sh  - Launch scripts\n", .{});
     }
 
     std.debug.print("\nDone.\n", .{});
