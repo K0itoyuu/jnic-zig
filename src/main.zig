@@ -52,7 +52,8 @@ pub fn main(init: std.process.Init) !void {
     const tmp_out = ".jnic_temp_out";
 
     // Clean and create temp dirs
-    runCmd(allocator, io, &.{ "rm", "-rf", tmp_in, tmp_out });
+    removeTree(allocator, io, tmp_in);
+    removeTree(allocator, io, tmp_out);
     Dir.cwd().createDirPath(io, tmp_in) catch {};
     Dir.cwd().createDirPath(io, tmp_out) catch {};
 
@@ -135,7 +136,8 @@ pub fn main(init: std.process.Init) !void {
     runCmd(allocator, io, &.{ "jar", "cfm", config.output_jar, manifest_path, "-C", tmp_out, "." });
 
     // Cleanup temp dirs
-    runCmd(allocator, io, &.{ "rm", "-rf", tmp_in, tmp_out });
+    removeTree(allocator, io, tmp_in);
+    removeTree(allocator, io, tmp_out);
 
     // Auto-compile native library and embed into JAR
     if (all_extracted.items.len > 0 and !config.use_ffm) {
@@ -159,9 +161,9 @@ pub fn main(init: std.process.Init) !void {
         const dll_jar_dir = "master/koitoyuu/jnic";
         Dir.cwd().createDirPath(io, dll_jar_dir) catch {};
 
-        // Copy DLL to jar structure dir
+        // Copy DLL to jar structure dir using Zig file API
         const dll_jar_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dll_jar_dir, dll_name });
-        runCmd(allocator, io, &.{ "cp", dll_name, dll_jar_path });
+        copyFile(io, dll_name, dll_jar_path);
 
         // Add to JAR
         runCmd(allocator, io, &.{ "jar", "uf", config.output_jar, dll_jar_path });
@@ -170,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
         Dir.cwd().deleteFile(io, dll_name) catch {};
         Dir.cwd().deleteFile(io, "native_jni.c") catch {};
         Dir.cwd().deleteFile(io, dll_jar_path) catch {};
-        runCmd(allocator, io, &.{ "rm", "-rf", dll_jar_dir });
+        removeTree(allocator, io, "master");
         // Also remove jnic_native.pdb if exists
         Dir.cwd().deleteFile(io, "jnic_native.pdb") catch {};
 
@@ -218,6 +220,25 @@ fn runCmdCwd(allocator: std.mem.Allocator, io: Io, argv: []const []const u8, cwd
             std.debug.print("  [cmd signal] {s}\n", .{argv[0]});
         },
     }
+}
+
+fn removeTree(allocator: std.mem.Allocator, io: Io, path: []const u8) void {
+    // Use platform-appropriate command to remove directory tree
+    if (@import("builtin").os.tag == .windows) {
+        runCmd(allocator, io, &.{ "cmd", "/c", "rmdir", "/s", "/q", path });
+    } else {
+        runCmd(allocator, io, &.{ "rm", "-rf", path });
+    }
+}
+
+fn copyFile(io: Io, src: []const u8, dst: []const u8) void {
+    const data = Dir.cwd().readFileAlloc(io, src, std.heap.page_allocator, .limited(256 * 1024 * 1024)) catch |err| {
+        std.debug.print("  [copy error] {s} -> {s}: {}\n", .{ src, dst, err });
+        return;
+    };
+    Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = data }) catch |err| {
+        std.debug.print("  [copy error] write {s}: {}\n", .{ dst, err });
+    };
 }
 
 fn copyNonClassFiles(allocator: std.mem.Allocator, io: Io, src_base: []const u8, dst_base: []const u8) void {
